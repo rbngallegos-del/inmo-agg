@@ -1,8 +1,8 @@
 openapi: 3.1.1
 info:
   title: Inmo Aggregator API
-  version: "0.2.1"
-  description: "API para buscar listados inmobiliarios normalizados (búsqueda abierta por tipo, precio y ciudad)."
+  version: "0.2.3"
+  description: "API mínima para búsqueda de inmuebles con múltiples fuentes."
 
 servers:
   - url: https://inmo-agg.onrender.com
@@ -26,7 +26,7 @@ paths:
   /search:
     get:
       operationId: searchListings
-      summary: "Buscar inmuebles normalizados"
+      summary: "Buscar inmuebles"
       parameters:
         - name: cities
           in: query
@@ -34,7 +34,6 @@ paths:
           required: false
           schema:
             type: string
-
         - name: min_price
           in: query
           description: "Precio mínimo (MXN)."
@@ -42,7 +41,6 @@ paths:
           schema:
             type: integer
             minimum: 0
-
         - name: max_price
           in: query
           description: "Precio máximo (MXN)."
@@ -50,50 +48,37 @@ paths:
           schema:
             type: integer
             minimum: 0
-
         - name: min_bedrooms
           in: query
-          description: "Recámaras mínimas (solo aplica a casa/departamento)."
+          description: "Recámaras mínimas (solo casa/departamento)."
           required: false
           schema:
             type: integer
             minimum: 0
-
         - name: furnished
           in: query
           description: "true/false; omitir para cualquiera."
           required: false
           schema:
             type: boolean
-
         - name: property_types
           in: query
-          description: "Tipos separados por coma: casa,departamento,terreno,local,oficina,bodega,otro"
+          description: "Tipos CSV: casa,departamento,terreno,local,oficina,bodega,otro"
           required: false
           schema:
             type: string
-
-        - name: property_type
-          in: query
-          description: "DEPRECATED: usa 'property_types' (compatibilidad)."
-          required: false
-          schema:
-            type: string
-
-        - name: sources
-          in: query
-          description: "Fuentes separadas por coma (identificadores de adapters)."
-          required: false
-          schema:
-            type: string
-
         - name: q
           in: query
           description: "Texto libre a buscar en el título."
           required: false
           schema:
             type: string
-
+        - name: sources
+          in: query
+          description: "Fuentes separadas por coma. Si se omite, consulta todas las fuentes registradas."
+          required: false
+          schema:
+            type: string
         - name: limit
           in: query
           description: "Límite de elementos (1-100)."
@@ -103,19 +88,17 @@ paths:
             minimum: 1
             maximum: 100
             default: 25
-
         - name: offset
           in: query
-          description: "Desplazamiento/paginación (>= 0)."
+          description: "Desplazamiento (>= 0)."
           required: false
           schema:
             type: integer
             minimum: 0
             default: 0
-
       responses:
         "200":
-          description: "Resultados de búsqueda"
+          description: "Resultados"
           content:
             application/json:
               schema:
@@ -135,22 +118,4 @@ components:
         type: { type: string }
         furnished: { type: boolean, nullable: true }
         location_city: { type: string, nullable: true }
-        location_colonia: { type: string, nullable: true }
-        url: { type: string }
-        source: { type: string }
-        photos:
-          type: array
-          items: { type: string }
-
-    SearchResponse:
-      type: object
-      properties:
-        results:
-          type: array
-          items:
-            $ref: "#/components/schemas/Listing"
-        total:
-          type: integer
-        next_offset:
-          type: integer
-          nullable: true
+        location_colonia: { type: string, nullable:_
