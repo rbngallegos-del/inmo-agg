@@ -1,4 +1,6 @@
 openapi: 3.1.0
+servers:
+- url: https://inmo-agg.onrender.com
 schema:
 type: string
 description: "Ciudades separadas por coma. Ej: 'Tampico,Ciudad Madero,Altamira'"
