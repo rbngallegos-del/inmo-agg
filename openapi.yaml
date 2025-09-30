@@ -1,0 +1,58 @@
+## 3) OpenAPI para Actions
+**openapi.yaml (versión 3.0.3 + nuevos parámetros)**
+```yaml
+openapi: 3.0.3
+info:
+title: Inmo Aggregator API
+version: "0.2.0"
+description: API simple para buscar listados inmobiliarios normalizados (búsqueda abierta por tipo, precio y ciudad).
+servers:
+- url: https://inmo-agg.onrender.com
+paths:
+/health:
+get:
+operationId: health
+summary: Health check
+responses:
+"200":
+description: OK
+content:
+application/json:
+schema:
+type: object
+properties:
+ok:
+type: boolean
+/search:
+get:
+operationId: searchListings
+summary: Buscar inmuebles normalizados
+parameters:
+- in: query
+name: cities
+schema:
+type: string
+description: "Ciudades separadas por coma. Dejar vacío para todas."
+- in: query
+name: min_price
+schema:
+type: integer
+minimum: 0
+- in: query
+name: max_price
+schema:
+type: integer
+minimum: 0
+- in: query
+name: min_bedrooms
+schema:
+type: integer
+minimum: 0
+- in: query
+name: furnished
+schema:
+type: boolean
+description: true/false; omitir para cualquiera
+- in: query
+name: property_types
+nullable: true
