@@ -1,38 +1,36 @@
 from fastapi import FastAPI, Query
 # Por ahora, devolvemos datos de prueba para validar el flujo.
-
-
 def demo_adapter():
-return [
-Listing(
-    id="demo1",
-    title="Depto 2 rec Col. Primavera",
-    price=9000,
-    bedrooms=2,
-    bathrooms=1,
-    type="departamento",
-    furnished=False,
-    location_city="Tampico",
-    location_colonia="Primavera",
-    url="https://ejemplo.local/depto-primavera",
-    source="demo",
-    photos=[],
-),
-Listing(
-    id="demo2",
-    title="Casa 2 rec Unidad Nacional",
-    price=10000,
-    bedrooms=2,
-    bathrooms=1.5,
-    type="casa",
-    furnished=True, # esta no debe pasar si furnished=False
-    location_city="Ciudad Madero",
-    location_colonia="Unidad Nacional",
-    url="https://ejemplo.local/casa-un",
-    source="demo",
-    photos=[],
-),
-]
+     return [
+           Listing(
+                 id="demo1",
+                 title="Depto 2 rec Col. Primavera",
+                 price=9000,
+                 bedrooms=2,
+                 bathrooms=1,
+                 type="departamento",
+                 furnished=False,
+                 location_city="Tampico",
+                 location_colonia="Primavera",
+                 url="https://ejemplo.local/depto-primavera",
+                 source="demo",
+                 photos=[],
+                 ),
+                 Listing(
+                       id="demo2",
+                       title="Casa 2 rec Unidad Nacional",
+                       price=10000,
+                       bedrooms=2,
+                       bathrooms=1.5,
+                       type="casa",
+                       furnished=True, # esta no debe pasar si furnished=False
+                       location_city="Ciudad Madero",
+                       location_colonia="Unidad Nacional",
+                       url="https://ejemplo.local/casa-un",
+                       source="demo",
+                       photos=[],
+                       ),
+            ]
 
 
 @app.get("/search", response_model=SearchResponse)
