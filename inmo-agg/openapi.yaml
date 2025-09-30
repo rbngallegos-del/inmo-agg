@@ -1,71 +1,79 @@
 openapi: 3.1.0
+info:
+  title: Inmo Aggregator API
+  version: "0.1.0"
 servers:
-- url: https://inmo-agg.onrender.com
-schema:
-type: string
-description: "Ciudades separadas por coma. Ej: 'Tampico,Ciudad Madero,Altamira'"
-- in: query
-name: min_price
-schema:
-type: integer
-minimum: 0
-default: 0
-- in: query
-name: max_price
-schema:
-type: integer
-minimum: 0
-default: 1000000000
-- in: query
-name: min_bedrooms
-schema:
-type: integer
-minimum: 0
-default: 0
-- in: query
-name: furnished
-schema:
-type: boolean
-description: true/false
-- in: query
-name: property_type
-schema:
-type: string
-enum: [casa, departamento, all]
-default: all
-responses:
-"200":
-description: Resultados
-content:
-application/json:
-schema:
-$ref: "#/components/schemas/SearchResponse"
-components:
-schemas:
-Listing:
-type: object
-properties:
-id: { type: string }
-title: { type: string }
-price: { type: number }
-currency: { type: string, default: MXN }
-bedrooms: { type: integer }
-bathrooms: { type: number, nullable: true }
-type: { type: string, enum: [casa, departamento, otro] }
-furnished: { type: boolean }
-location_city: { type: string }
-location_colonia: { type: string, nullable: true }
-url: { type: string }
-source: { type: string }
-photos:
-type: array
-items: { type: string }
-SearchResponse:
-type: object
-properties:
-results:
-type: array
-items:
-$ref: "#/components/schemas/Listing"
-total:
-type: integer
+  - url: https://inmo-agg.onrender.com
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+  /search:
+    get:
+      operationId: searchListings
+      summary: Buscar inmuebles normalizados
+      parameters:
+        - in: query
+          name: cities
+          schema:
+            type: string
+          description: Ciudades separadas por coma. Ej: "Tampico,Ciudad Madero,Altamira"
+        - in: query
+          name: min_price
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: max_price
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: min_bedrooms
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: furnished
+          schema:
+            type: boolean
+        - in: query
+          name: property_type
+          schema:
+            type: string
+            enum: [casa, departamento, all]
+      responses:
+        "200":
+          description: Resultados de búsqueda
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        title: { type: string }
+                        price: { type: number }
+                        bedrooms: { type: integer }
+                        type: { type: string }
+                        furnished: { type: boolean }
+                        location_city: { type: string }
+                        url: { type: string }
+                        source: { type: string }
+                  total:
+                    type: integer
