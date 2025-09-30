@@ -1,58 +1,138 @@
-## 3) OpenAPI para Actions
-**openapi.yaml (versión 3.0.3 + nuevos parámetros)**
-```yaml
-openapi: 3.0.3
+openapi: 3.1.1
 info:
-title: Inmo Aggregator API
-version: "0.2.0"
-description: API simple para buscar listados inmobiliarios normalizados (búsqueda abierta por tipo, precio y ciudad).
+  title: Inmo Aggregator API
+  version: 0.2.0
+  description: API para buscar listados inmobiliarios normalizados.
 servers:
-- url: https://inmo-agg.onrender.com
+  - url: https://inmo-agg.onrender.com
 paths:
-/health:
-get:
-operationId: health
-summary: Health check
-responses:
-"200":
-description: OK
-content:
-application/json:
-schema:
-type: object
-properties:
-ok:
-type: boolean
-/search:
-get:
-operationId: searchListings
-summary: Buscar inmuebles normalizados
-parameters:
-- in: query
-name: cities
-schema:
-type: string
-description: "Ciudades separadas por coma. Dejar vacío para todas."
-- in: query
-name: min_price
-schema:
-type: integer
-minimum: 0
-- in: query
-name: max_price
-schema:
-type: integer
-minimum: 0
-- in: query
-name: min_bedrooms
-schema:
-type: integer
-minimum: 0
-- in: query
-name: furnished
-schema:
-type: boolean
-description: true/false; omitir para cualquiera
-- in: query
-name: property_types
-nullable: true
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+  /search:
+    get:
+      operationId: searchListings
+      summary: Buscar inmuebles normalizados
+      parameters:
+        - in: query
+          name: cities
+          schema:
+            type: string
+          description: Ciudades separadas por coma. Vacío = todas.
+        - in: query
+          name: min_price
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: max_price
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: min_bedrooms
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: furnished
+          schema:
+            type: boolean
+          description: true/false; omitir para cualquiera
+        - in: query
+          name: property_types
+          schema:
+            type: string
+          description: "Tipos separados por coma: casa,departamento,terreno,local,oficina,bodega,otro"
+        - in: query
+          name: sources
+          schema:
+            type: string
+          description: Fuentes separadas por coma (identificadores de adapters)
+        - in: query
+          name: q
+          schema:
+            type: string
+          description: Texto libre a buscar en el título
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+          example: 25
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+          example: 0
+      responses:
+        "200":
+          description: Resultados
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+components:
+  schemas:
+    Listing:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        price:
+          type: number
+        currency:
+          type: string
+          default: MXN
+        bedrooms:
+          type: integer
+          nullable: true
+        bathrooms:
+          type: number
+          nullable: true
+        type:
+          type: string
+        furnished:
+          type: boolean
+          nullable: true
+        location_city:
+          type: string
+          nullable: true
+        location_colonia:
+          type: string
+          nullable: true
+        url:
+          type: string
+        source:
+          type: string
+        photos:
+          type: array
+          items:
+            type: string
+    SearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Listing"
+        total:
+          type: integer
+        next_offset:
+          type: integer
+          nullable: true
