@@ -1,10 +1,11 @@
 openapi: 3.1.1
 info:
   title: Inmo Aggregator API
-  version: 0.2.0
-  description: API para buscar listados inmobiliarios normalizados.
+  version: "0.2.0"
+  description: "API para buscar listados inmobiliarios normalizados (búsqueda abierta por tipo, precio y ciudad)."
 servers:
   - url: https://inmo-agg.onrender.com
+
 paths:
   /health:
     get:
@@ -20,16 +21,17 @@ paths:
                 properties:
                   ok:
                     type: boolean
+
   /search:
     get:
       operationId: searchListings
-      summary: Buscar inmuebles normalizados
+      summary: "Buscar inmuebles normalizados"
       parameters:
         - in: query
           name: cities
           schema:
             type: string
-          description: Ciudades separadas por coma. Vacío = todas.
+          description: "Ciudades separadas por coma. Vacío = todas."
         - in: query
           name: min_price
           schema:
@@ -48,91 +50,3 @@ paths:
         - in: query
           name: furnished
           schema:
-            type: boolean
-          description: true/false; omitir para cualquiera
-        - in: query
-          name: property_types
-          schema:
-            type: string
-          description: "Tipos separados por coma: casa,departamento,terreno,local,oficina,bodega,otro"
-        - in: query
-          name: sources
-          schema:
-            type: string
-          description: Fuentes separadas por coma (identificadores de adapters)
-        - in: query
-          name: q
-          schema:
-            type: string
-          description: Texto libre a buscar en el título
-        - in: query
-          name: limit
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-          example: 25
-        - in: query
-          name: offset
-          schema:
-            type: integer
-            minimum: 0
-          example: 0
-      responses:
-        "200":
-          description: Resultados
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SearchResponse"
-components:
-  schemas:
-    Listing:
-      type: object
-      properties:
-        id:
-          type: string
-        title:
-          type: string
-        price:
-          type: number
-        currency:
-          type: string
-          default: MXN
-        bedrooms:
-          type: integer
-          nullable: true
-        bathrooms:
-          type: number
-          nullable: true
-        type:
-          type: string
-        furnished:
-          type: boolean
-          nullable: true
-        location_city:
-          type: string
-          nullable: true
-        location_colonia:
-          type: string
-          nullable: true
-        url:
-          type: string
-        source:
-          type: string
-        photos:
-          type: array
-          items:
-            type: string
-    SearchResponse:
-      type: object
-      properties:
-        results:
-          type: array
-          items:
-            $ref: "#/components/schemas/Listing"
-        total:
-          type: integer
-        next_offset:
-          type: integer
-          nullable: true
