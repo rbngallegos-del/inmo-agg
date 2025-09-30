@@ -1,20 +1,53 @@
 openapi: 3.1.1
 info:
   title: Inmo Aggregator API
-  version: "0.2.3"
+  version: "0.2.4"
   description: "API mínima para búsqueda de inmuebles con múltiples fuentes."
 
 servers:
   - url: https://inmo-agg.onrender.com
 
+components:
+  schemas:
+    Listing:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        price: { type: number }
+        currency: { type: string, default: MXN }
+        bedrooms: { type: integer, nullable: true }
+        bathrooms: { type: number, nullable: true }
+        type: { type: string }
+        furnished: { type: boolean, nullable: true }
+        location_city: { type: string, nullable: true }
+        location_colonia: { type: string, nullable: true }
+        url: { type: string }
+        source: { type: string }
+        photos:
+          type: array
+          items: { type: string }
+    SearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Listing"
+        total:
+          type: integer
+        next_offset:
+          type: integer
+          nullable: true
+
 paths:
   /health:
     get:
       operationId: health
-      summary: Health check
+      summary: "Health check"
       responses:
         "200":
-          description: OK
+          description: "OK"
           content:
             application/json:
               schema:
@@ -75,7 +108,7 @@ paths:
             type: string
         - name: sources
           in: query
-          description: "Fuentes separadas por coma. Si se omite, consulta todas las fuentes registradas."
+          description: "Fuentes separadas por coma. Omitir = todas las fuentes."
           required: false
           schema:
             type: string
@@ -103,19 +136,3 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SearchResponse"
-
-components:
-  schemas:
-    Listing:
-      type: object
-      properties:
-        id: { type: string }
-        title: { type: string }
-        price: { type: number }
-        currency: { type: string, default: MXN }
-        bedrooms: { type: integer, nullable: true }
-        bathrooms: { type: number, nullable: true }
-        type: { type: string }
-        furnished: { type: boolean, nullable: true }
-        location_city: { type: string, nullable: true }
-        location_colonia: { type: string, nullable:_
