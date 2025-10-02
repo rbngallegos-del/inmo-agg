@@ -96,6 +96,18 @@ async def adapter_alemar() -> List[Listing]: return []
 async def adapter_inmuebles24() -> List[Listing]: return []
 
 # ===== Registro y búsqueda =====
+# Ruta mínima para que /search exista y devuelva datos de demo
+@app.get("/search", response_model=SearchResponse)
+async def search(
+    cities: Optional[str] = Query(None),
+    min_price: Optional[float] = Query(None),
+    max_price: Optional[float] = Query(None),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    data = await adapter_demo()  # usamos la lista de demo que ya tienes
+    return SearchResponse(results=data, total=len(data), next_offset=None)
+    
 ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
     "demo": adapter_demo,
     "remax": adapter_remax,
