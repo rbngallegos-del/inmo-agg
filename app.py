@@ -1,11 +1,13 @@
 # app.py
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Callable, Any, Coroutine
 import asyncio
 
-# ===== Modelos =====
+# =========================
+# Modelos
+# =========================
 class Listing(BaseModel):
     id: str
     title: str
@@ -26,7 +28,9 @@ class SearchResponse(BaseModel):
     total: int
     next_offset: Optional[int] = None
 
-# ===== App =====
+# =========================
+# App
+# =========================
 app = FastAPI(title="Inmo Aggregator", version="0.2.4")
 app.add_middleware(
     CORSMiddleware,
@@ -38,11 +42,26 @@ app.add_middleware(
 def root():
     return {"service": "Inmo Aggregator", "status": "ok", "version": "0.2.4"}
 
+# (Render hace HEAD / como healthcheck; respondemos 200 para callar el 405)
+@app.head("/", include_in_schema=False)
+def root_head():
+    return Response(status_code=200)
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# ===== Adapters demo =====
+# (Opcional: logger rápido de requests para depurar rutas; puedes comentarlo)
+# @app.middleware("http")
+# async def log_requests(request, call_next):
+#    print(f">>> {request.method} {request.url.path}?{request.url.query}")
+#    resp = await call_next(request)
+#    print(f"<<< {resp.status_code} {request.url.path}")
+#    return resp
+
+# =========================
+# Adapters (demo y stubs)
+# =========================
 async def adapter_demo() -> List[Listing]:
     await asyncio.sleep(0.01)
     return [
@@ -90,24 +109,14 @@ async def adapter_demo() -> List[Listing]:
         ),
     ]
 
-# Stubs de otros portales (vacíos por ahora)
+# Stubs de otras fuentes (agregaremos lógica real después)
 async def adapter_remax() -> List[Listing]: return []
 async def adapter_alemar() -> List[Listing]: return []
 async def adapter_inmuebles24() -> List[Listing]: return []
 
-# ===== Registro y búsqueda =====
-# Ruta mínima para que /search exista y devuelva datos de demo
-@app.get("/search", response_model=SearchResponse)
-async def search(
-    cities: Optional[str] = Query(None),
-    min_price: Optional[float] = Query(None),
-    max_price: Optional[float] = Query(None),
-    limit: int = Query(25, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-):
-    data = await adapter_demo()  # usamos la lista de demo que ya tienes
-    return SearchResponse(results=data, total=len(data), next_offset=None)
-    
+# =========================
+# Registro y búsqueda
+# =========================
 ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
     "demo": adapter_demo,
     "remax": adapter_remax,
@@ -116,7 +125,7 @@ ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
 }
 
 class SearchRequest(BaseModel):
-    # Campos alineados a tu openapi.yaml (snake_case)
+    # Alineado con tu openapi.yaml (snake_case)
     cities: Optional[List[str]] = None            # ["Tampico","Ciudad Madero"]
     min_price: Optional[float] = None
     max_price: Optional[float] = None
@@ -155,7 +164,7 @@ def _passes_filters(l: Listing, q: SearchRequest) -> bool:
         return False
     if q.max_price is not None and l.price > q.max_price:
         return False
-    # bedrooms (solo casa/departamento)
+    # bedrooms (solo para casa/departamento)
     if q.min_bedrooms is not None:
         tipo = (l.type or "").lower()
         if tipo in {"casa", "departamento", "depto"}:
@@ -185,7 +194,10 @@ async def _search_core(q: SearchRequest) -> SearchResponse:
     next_off = end if end < len(filtered) else None
     return SearchResponse(results=page, total=len(filtered), next_offset=next_off)
 
-# ---------- GET /search (como en tu OpenAPI) ----------
+# =========================
+# Endpoints
+# =========================
+# GET /search (tal como en tu openapi.yaml)
 @app.get("/search", response_model=SearchResponse)
 async def search_get(
     cities: Optional[str] = Query(None, description="CSV de ciudades"),
@@ -213,7 +225,7 @@ async def search_get(
     )
     return await _search_core(req)
 
-# ---------- Aliases por compatibilidad ----------
+# Alias opcionales por compatibilidad si alguna acción vieja los llama:
 @app.get("/search-listings", response_model=SearchResponse)
 async def search_listings_alias(**kwargs):
     return await search_get(**kwargs)
@@ -222,7 +234,7 @@ async def search_listings_alias(**kwargs):
 async def searchListings_alias(**kwargs):
     return await search_get(**kwargs)
 
-# ---------- POST /search (body JSON) ----------
+# POST /search (por si quieres mandar JSON en vez de querystring)
 @app.post("/search", response_model=SearchResponse)
 async def search_post(req: SearchRequest):
     return await _search_core(req)
