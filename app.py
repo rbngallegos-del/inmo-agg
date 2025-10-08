@@ -337,6 +337,133 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
             break
 
     return out
+async def remax_discover_detail_urls(max_urls: int = 40) -> List[str]:
+    """
+    Busca URLs de detalle /propiedad/... desde el sitemap principal.
+    Si el sitemap lista otros sitemaps, también los sigue.
+    """
+    roots = ["https://remax.com.mx/sitemap.xml"]
+    seen = set()
+    found: List[str] = []
+
+    async def fetch_xml(url: str) -> Optional[str]:
+        try:
+            async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "InmoAgg/0.3.0"}) as c:
+                r = await c.get(url, follow_redirects=True)
+                if r.status_code != 200:
+                    print(f"[remax] sitemap HTTP {r.status_code}: {url}")
+                    return None
+                return r.text
+        except Exception as e:
+            print(f"[remax] sitemap error {url}: {e}")
+            return None
+
+    # BFS simple sobre sitemaps
+    queue = list(roots)
+    while queue and len(found) < max_urls:
+        sm_url = queue.pop(0)
+        if sm_url in seen:
+            continue
+        seen.add(sm_url)
+        xml = await fetch_xml(sm_url)
+        if not xml:
+            continue
+
+        soup = BeautifulSoup(xml, "xml")
+
+        # si es índice de sitemaps
+        for sm in soup.find_all("sitemap"):
+            loc = sm.find("loc")
+            if loc and loc.text and loc.text not in seen:
+                queue.append(loc.text.strip())
+
+        # si es sitemap de URLs
+        for url in soup.find_all("url"):
+            loc = url.find("loc")
+            if not loc or not loc.text:
+                continue
+            loc_text = loc.text.strip()
+            if "/propiedad/" in loc_text:
+                found.append(loc_text)
+                if len(found) >= max_urls:
+                    break
+
+    # dedupe/limit
+    uniq = []
+    seen_u = set()
+    for u in found:
+        if u not in seen_u:
+            uniq.append(u)
+            seen_u.add(u)
+        if len(uniq) >= max_urls:
+            break
+    return uniq
+
+def extract_from_property_detail(html: str, base_url: str, source: str, url: str, idx: int) -> Optional[Listing]:
+    """
+    Extrae un Listing desde la PÁGINA DE DETALLE usando JSON-LD; si no hay,
+    aplica heurística básica (título, precio, imagen).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) JSON-LD → es lo ideal en páginas de detalle
+    items = parse_jsonld_listings(html, base_url=base_url, source=source)
+    if items:
+        # el JSON-LD a veces produce varios bloques; escogemos el más caro o el que tenga título
+        items_sorted = sorted(items, key=lambda x: (x.price or 0), reverse=True)
+        best = items_sorted[0]
+        # Forzamos la URL real de detalle (por si el JSON-LD traía relativa)
+        best.url = url
+        return best
+
+    # 2) Heurística mínima
+    title = ""
+    for sel in ["h1", ".title", ".titulo", "[class*='title']"]:
+        h = soup.select_one(sel)
+        if h:
+            title = h.get_text(strip=True)
+            break
+
+    price_text = ""
+    for sel in [".price", ".precio", "[class*='price']", "[class*='precio']"]:
+        p = soup.select_one(sel)
+        if p:
+            price_text = p.get_text(strip=True)
+            break
+    if not price_text:
+        body = soup.get_text(" ", strip=True)
+        m = re.search(r"\$\s*[\d.,\s]+", body)
+        if m:
+            price_text = m.group(0)
+
+    img_url = None
+    img = soup.select_one("img")
+    if img and img.get("src"):
+        img_url = _to_abs(base_url, img["src"])
+
+    ltype = _infer_type(title)
+    beds  = _beds(html.lower())
+    baths = _baths(html.lower())
+
+    # Si ni título ni precio, descarta
+    if not title and _parse_price(price_text) == 0:
+        return None
+
+    return Listing(
+        id=f"{source}-detail-{idx}",
+        title=title or "Propiedad",
+        price=_parse_price(price_text),
+        currency="MXN",
+        bedrooms=beds,
+        bathrooms=baths,
+        type=ltype,
+        furnished=None,
+        location_city=None,
+        location_colonia=None,
+        url=url,
+        source=source,
+        photos=[img_url] if img_url else [],
+    )
 
 async def scrape_generic_list(url: str, source: str) -> List[Listing]:
     cache_key = f"scrape::{source}::{url}"
@@ -390,8 +517,8 @@ async def adapter_demo() -> List[Listing]:
 
 # Mapa de sitios → URL de listado "obvia" (ajustable)
 SITES: Dict[str, str] = {
-    "remax":                    "https://remax.com.mx/propiedades",
-    "aysainmobiliaria":        "https://www.aysainmobiliaria.com.mx/",               # revisar subruta de propiedades
+    "remax":                   "https://remax.com.mx/propiedades",
+    "aysainmobiliaria":        "https://www.aysainmobiliaria.com.mx/",              # revisar subruta de propiedades
     "cuvier":                  "https://cuvierbienesraices.inmo.co/",               # suele tener /propiedades
     "suma":                    "https://www.sumabienes.com/",                       # revisar /propiedades /listings
     "orva":                    "https://www.orvabienes.com.mx/Propiedades",
@@ -404,7 +531,7 @@ SITES: Dict[str, str] = {
     "prourbe":                 "https://www.prourbe.mx/",                           # ajustar
     "inmobiliariaentampico":   "https://www.inmobiliariaentampico.com/",            # ajustar
     "elite":                   "https://www.bienesraiceselite.com.mx/",             # ajustar
-    "leemar":                  "https://www.leemar.mx/",                             # ajustar
+    "leemar":                  "https://www.leemar.mx/",                            # ajustar
     "logica":                  "https://www.logicainmobiliaria.com.mx/",            # ajustar
     "realestatetampico":       "https://www.realestatetampico.com/",                # ajustar
     "3a":                      "https://www.3ainmobiliaria.mx/Propiedades",
@@ -422,7 +549,35 @@ async def adapter_site(key: str) -> List[Listing]:
     return await scrape_generic_list(url, source=key)
 
 # Creamos funciones concretas para cada clave (por claridad)
-async def adapter_remax() -> List[Listing]:                   return await adapter_site("remax")
+# ===== RE/MAX: lista -> si no hay, usar sitemap de detalle =====
+async def adapter_remax() -> List[Listing]:
+    base_list_url = "https://remax.com.mx/propiedades"
+
+    # 1) Intento normal: lista
+    cards = await scrape_generic_list(base_list_url, source="remax")
+    if cards:
+        return cards
+
+    # 2) Fallback robusto: sitemap -> páginas /propiedad/... -> parse JSON-LD
+    detail_urls = await remax_discover_detail_urls(max_urls=40)
+    if not detail_urls:
+        return []
+
+    listings: List[Listing] = []
+    for i, u in enumerate(detail_urls):
+        if len(listings) >= MAX_CARDS:
+            break
+        html = await fetch_html(u)
+        if not html:
+            continue
+        item = extract_from_property_detail(html, base_url="https://remax.com.mx", source="remax", url=u, idx=i)
+        if item:
+            listings.append(item)
+
+    if listings:
+        CACHE.set("scrape::remax::fallback", listings, ttl_seconds=TTL_SECONDS)
+    return listings
+
 async def adapter_aysainmobiliaria() -> List[Listing]:        return await adapter_site("aysainmobiliaria")
 async def adapter_cuvier() -> List[Listing]:                  return await adapter_site("cuvier")
 async def adapter_suma() -> List[Listing]:                    return await adapter_site("suma")
