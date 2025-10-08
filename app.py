@@ -227,69 +227,95 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
     soup = BeautifulSoup(html, "html.parser")
     out: List[Listing] = []
 
-    # Heurística: encontrar enlaces a detalles de propiedad (contienen /propiedad, /propiedades, /property)
-    anchors = soup.select('a[href*="propiedad"], a[href*="propiedades"], a[href*="property"]')
+    # Aceptar SOLO páginas de detalle: /propiedad/...
+    anchors = soup.select('a[href*="/propiedad/"]')
     seen = set()
-    for a in anchors[: MAX_CARDS * 3]:  # amplio porque filtramos duplicados
+
+    def is_bad_title(t: str) -> bool:
+        if not t: return True
+        t = t.strip().lower()
+        # descartar CTAs y textos genéricos
+        bad = {
+            "busca una propiedad", "buscar", "ver más", "ver mas",
+            "contacto", "más info", "mas info", "ver detalles"
+        }
+        return t in bad or len(t) < 3
+
+    for a in anchors[: MAX_CARDS * 3]:
         href = a.get("href") or ""
         abs_url = _to_abs(base_url, href)
-        if not abs_url or abs_url in seen: continue
+        if not abs_url or abs_url in seen: 
+            continue
         seen.add(abs_url)
 
-        # subimos al contenedor de la tarjeta
+        # Subimos al contenedor de la tarjeta (article/.card/figure…)
         card = a
-        for _ in range(4):
-            if card and (card.select_one("img") or card.select_one(".price, .precio") or card.select_one(".location, .ubicacion")):
+        for _ in range(6):
+            if not card or getattr(card, "name", "").lower() in ("body", "html"):
+                break
+            if card.select_one("img") or card.select_one(".price, .precio, [class*='price'], [class*='precio']") \
+               or card.select_one(".location, .ubicacion, [class*='ubicacion'], [class*='location']"):
                 break
             card = card.parent
 
-        # título
+        # Título
         title = (a.get_text(strip=True) or "").strip()
-        if not title:
+        if is_bad_title(title):
+            # prueba con encabezados dentro de la tarjeta
             h = None
-            for sel in ["h3", "h2", ".card-title", ".titulo", ".title"]:
+            for sel in ["h1","h2","h3",".card-title",".titulo",".title","[class*='titulo']","[class*='title']"]:
                 h = card.select_one(sel) if card else None
-                if h: break
-            if h: title = h.get_text(strip=True)
+                if h:
+                    title = h.get_text(strip=True)
+                    break
 
-        # precio
+        if is_bad_title(title):
+            # si sigue siendo malo, descártalo
+            continue
+
+        # Precio
         price_text = ""
         price_node = None
         if card:
-            for cand in [card.select_one(".price"), card.select_one(".precio")]:
+            for sel in [".price", ".precio", "[class*='price']", "[class*='precio']"]:
+                cand = card.select_one(sel)
                 if cand:
                     price_node = cand
                     break
         if price_node:
             price_text = price_node.get_text(strip=True)
         else:
-            # busca cualquier texto con $
-            if card:
-                t = card.get_text(" ", strip=True)
-                m = re.search(r"\$\s*[\d.,\s]+", t)
-                if m: price_text = m.group(0)
+            # como fallback, busca un patrón de $ dentro del texto de la tarjeta
+            t = card.get_text(" ", strip=True) if card else ""
+            m = re.search(r"\$\s*[\d.,\s]+", t)
+            if m:
+                price_text = m.group(0)
 
-        # ubicación
+        price = _parse_price(price_text)
+
+        # Ubicación
         loc_text = ""
         if card:
-            for cand in [card.select_one(".location"), card.select_one(".ubicacion")]:
+            for sel in [".location", ".ubicacion", "[class*='ubicacion']", "[class*='location']"]:
+                cand = card.select_one(sel)
                 if cand:
                     loc_text = cand.get_text(strip=True)
                     break
 
-        # imagen
+        city, colonia = _split_city_colonia(loc_text)
+
+        # Imagen
         photo_url = None
         if card:
             img = card.select_one("img")
             if img and img.get("src"):
                 photo_url = _to_abs(base_url, img["src"])
 
-        # normalizar
-        price = _parse_price(price_text)
-        city, colonia = _split_city_colonia(loc_text)
-        ltype = _infer_type(title + " " + loc_text)
-        beds = _beds(title + " " + loc_text)
-        baths = _baths(title + " " + loc_text)
+        # Tipo + cuartos/baños (heurístico por texto)
+        card_text = ((title or "") + " " + (loc_text or "")).lower()
+        ltype = _infer_type(card_text)
+        beds  = _beds(card_text)
+        baths = _baths(card_text)
 
         out.append(Listing(
             id=f"{source}-card-{len(out)}",
