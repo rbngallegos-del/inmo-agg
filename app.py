@@ -3,7 +3,7 @@ from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Callable, Any, Coroutine, Tuple
-import asyncio, time, re, os, json
+import asyncio, time, re, os, json, io, gzip
 import httpx
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 # =========================
 # Config (ajustable por env)
 # =========================
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")     # cache 5 min
 MAX_CARDS   = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
 ADAPTER_TIMEOUT = float(os.getenv("ADAPTER_TIMEOUT_SECONDS", "8"))     # tiempo máx por sitio
@@ -342,33 +342,48 @@ async def scrape_generic_list(url: str, source: str) -> List[Listing]:
     return out
 
 # =========================
-# RE/MAX: sitemap + detalle (fallback)
+# RE/MAX: sitemap + detalle (fallback con .gz)
 # =========================
-async def remax_discover_detail_urls(max_urls: int = 40) -> List[str]:
-    roots = ["https://remax.com.mx/sitemap.xml"]
+async def remax_discover_detail_urls(max_urls: int = 40, max_sitemaps: int = 10) -> List[str]:
+    roots = ["https://www.remax.com.mx/sitemap.xml"]
     seen = set()
+    seen_sitemaps = 0
     found: List[str] = []
 
-    async def fetch_text(url: str) -> Optional[str]:
+    async def fetch_sitemap(url: str) -> Optional[str]:
         try:
             async with httpx.AsyncClient(timeout=_httpx_timeout(), headers={"User-Agent": f"InmoAgg/{APP_VERSION}"}) as c:
                 r = await c.get(url, follow_redirects=True)
                 if r.status_code != 200:
                     print(f"[remax] sitemap HTTP {r.status_code}: {url}")
                     return None
-                return r.text
+                # Si viene comprimido .gz, descomprimir desde r.content
+                content = r.content or b""
+                ct = (r.headers.get("content-type") or "").lower()
+                ce = (r.headers.get("content-encoding") or "").lower()
+                if url.endswith(".gz") or "gzip" in ce or "application/x-gzip" in ct:
+                    try:
+                        content = gzip.decompress(content)
+                    except Exception as e:
+                        # algunos servers ya lo entregan inflado aunque .gz en URL
+                        pass
+                try:
+                    return content.decode("utf-8", "ignore")
+                except Exception:
+                    return content.decode("latin-1", "ignore")
         except Exception as e:
             print(f"[remax] sitemap error {url}: {e}")
             return None
 
     queue = list(roots)
-    while queue and len(found) < max_urls:
+    while queue and len(found) < max_urls and seen_sitemaps < max_sitemaps:
         sm_url = queue.pop(0)
         if sm_url in seen:
             continue
         seen.add(sm_url)
+        seen_sitemaps += 1
 
-        xml = await fetch_text(sm_url)
+        xml = await fetch_sitemap(sm_url)
         if not xml:
             continue
 
@@ -380,13 +395,15 @@ async def remax_discover_detail_urls(max_urls: int = 40) -> List[str]:
 
         ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
+        # sitemapindex → más sitemaps (respetando el límite)
         for sm in root.findall("sm:sitemap", ns):
             loc = sm.find("sm:loc", ns)
-            if loc is not None and loc.text:
+            if loc is not None and loc.text and len(queue) + seen_sitemaps < max_sitemaps:
                 loc_text = loc.text.strip()
                 if loc_text not in seen:
                     queue.append(loc_text)
 
+        # urlset → URLs de detalle
         for u in root.findall("sm:url", ns):
             loc = u.find("sm:loc", ns)
             if loc is None or not loc.text:
@@ -397,6 +414,7 @@ async def remax_discover_detail_urls(max_urls: int = 40) -> List[str]:
                 if len(found) >= max_urls:
                     break
 
+    # dedupe + límite
     uniq: List[str] = []
     seen_u = set()
     for u in found:
@@ -486,7 +504,7 @@ async def adapter_demo() -> List[Listing]:
     ]
 
 SITES: Dict[str, str] = {
-    "remax":                    "https://remax.com.mx/propiedades",
+    "remax":                    "https://www.remax.com.mx/propiedades",
     "aysainmobiliaria":        "https://www.aysainmobiliaria.com.mx/",
     "cuvier":                  "https://cuvierbienesraices.inmo.co/",
     "suma":                    "https://www.sumabienes.com/",
@@ -527,8 +545,8 @@ async def adapter_remax() -> List[Listing]:
         cards = await scrape_generic_list(base_list_url, source="remax")
         if cards:
             return cards
-        # Fallback: sitemap → detalle
-        detail_urls = await remax_discover_detail_urls(max_urls=40)
+        # Fallback: sitemap (con .gz) → detalle (limitado)
+        detail_urls = await remax_discover_detail_urls(max_urls=30, max_sitemaps=8)
         if not detail_urls:
             return []
         listings: List[Listing] = []
@@ -538,7 +556,7 @@ async def adapter_remax() -> List[Listing]:
             html = await fetch_html(u)
             if not html:
                 continue
-            item = extract_from_property_detail(html, base_url="https://remax.com.mx", source="remax", url=u, idx=i)
+            item = extract_from_property_detail(html, base_url="https://www.remax.com.mx", source="remax", url=u, idx=i)
             if item:
                 listings.append(item)
         if listings:
@@ -620,7 +638,6 @@ def _csv_to_list(s: Optional[str]) -> Optional[List[str]]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listing]]]) -> List[Listing]:
-    # Limitar concurrencia + timeout por sitio
     async with SEM:
         try:
             return await asyncio.wait_for(fn(), timeout=ADAPTER_TIMEOUT)
@@ -632,10 +649,9 @@ async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listi
             return []
 
 async def _collect_sources(sources: Optional[List[str]]) -> List[Listing]:
-    # Por defecto, SOLO demo (para que nunca se cuelgue si no se pasan sources)
     keys = sources if sources else [s.strip() for s in DEFAULT_SOURCES.split(",") if s.strip()]
     tasks = [asyncio.create_task(_run_adapter(k, ADAPTERS[k])) for k in keys if k in ADAPTERS]
-    if not tasks: 
+    if not tasks:
         return []
     results = await asyncio.gather(*tasks, return_exceptions=False)
     out: List[Listing] = []
