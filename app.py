@@ -3,9 +3,9 @@ from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Callable, Any, Coroutine
-import asyncio
-import os
-
+import asyncio, time, re, os
+import httpx
+from bs4 import BeautifulSoup
 
 # =========================
 # Modelos
@@ -33,7 +33,7 @@ class SearchResponse(BaseModel):
 # =========================
 # App
 # =========================
-app = FastAPI(title="Inmo Aggregator", version="0.2.4")
+app = FastAPI(title="Inmo Aggregator", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -42,9 +42,8 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"service": "Inmo Aggregator", "status": "ok", "version": "0.2.4"}
+    return {"service": "Inmo Aggregator", "status": "ok", "version": "0.3.0"}
 
-# (Render hace HEAD / como healthcheck; respondemos 200 para callar el 405)
 @app.head("/", include_in_schema=False)
 def root_head():
     return Response(status_code=200)
@@ -53,166 +52,425 @@ def root_head():
 def health():
     return {"ok": True}
 
-# (Opcional: logger rápido de requests para depurar rutas; puedes comentarlo)
-# @app.middleware("http")
-# async def log_requests(request, call_next):
-#    print(f">>> {request.method} {request.url.path}?{request.url.query}")
-#    resp = await call_next(request)
-#    print(f"<<< {resp.status_code} {request.url.path}")
-#    return resp
+# =========================
+# Cache simple (TTL)
+# =========================
+class SimpleCache:
+    def __init__(self):
+        self.data: Dict[str, Any] = {}
+    def get(self, key: str):
+        item = self.data.get(key)
+        if not item: return None
+        expiry, value = item
+        if time.time() > expiry:
+            self.data.pop(key, None)
+            return None
+        return value
+    def set(self, key: str, value, ttl_seconds: int = 300):
+        self.data[key] = (time.time() + ttl_seconds, value)
+
+CACHE = SimpleCache()
+
+TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")
+MAX_CARDS = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
 
 # =========================
-# Adapters (demo y stubs)
+# Utilidades de scraping
+# =========================
+PRICE_RE = re.compile(r"(\d[\d.,\s]*)")
+BED_RE   = re.compile(r"(\d+)\s*(rec|recámaras|habitaciones|hab)", re.I)
+BATH_RE  = re.compile(r"(\d+(?:\.\d+)?)\s*(baños|banos|ba\u00f1os|bath)", re.I)
+
+def _to_abs(url_base: str, href: str) -> str:
+    if not href: return ""
+    if href.startswith("http://") or href.startswith("https://"): return href
+    if href.startswith("//"): return "https:" + href
+    if href.startswith("/"):
+        # normaliza host sin slash final
+        base = url_base[:-1] if url_base.endswith("/") else url_base
+        return base + href
+    # relativo
+    base = url_base if url_base.endswith("/") else url_base + "/"
+    return base + href
+
+def _parse_price(text: str) -> float:
+    if not text: return 0.0
+    raw = PRICE_RE.search(text.replace(",", ""))
+    if not raw: return 0.0
+    try: return float(raw.group(1).replace(" ", ""))
+    except: return 0.0
+
+def _infer_type(text: str) -> str:
+    t = (text or "").lower()
+    for k, v in [
+        ("departamento", "departamento"),
+        ("depto", "departamento"),
+        ("casa", "casa"),
+        ("oficina", "oficina"),
+        ("bodega", "bodega"),
+        ("local", "local"),
+        ("terreno", "terreno"),
+        ("edificio", "edificio"),
+        ("loft", "departamento"),
+        ("ph", "departamento"),
+    ]:
+        if k in t: return v
+    return "otro"
+
+def _beds(text: str) -> Optional[int]:
+    if not text: return None
+    m = BED_RE.search(text.lower())
+    if not m: return None
+    try: return int(m.group(1))
+    except: return None
+
+def _baths(text: str) -> Optional[float]:
+    if not text: return None
+    m = BATH_RE.search(text.lower())
+    if not m: return None
+    try: return float(m.group(1))
+    except: return None
+
+def _split_city_colonia(loc_text: str) -> (Optional[str], Optional[str]):
+    if not loc_text: return (None, None)
+    parts = [p.strip() for p in re.split(r"[\/,\-\|·•]+", loc_text) if p.strip()]
+    city = parts[-1] if parts else None
+    colonia = parts[0] if len(parts) >= 2 else None
+    return (city, colonia)
+
+async def fetch_html(url: str) -> Optional[str]:
+    try:
+        async with httpx.AsyncClient(timeout=25.0, headers={"User-Agent": "InmoAgg/0.3.0"}) as client:
+            r = await client.get(url, follow_redirects=True)
+            if r.status_code != 200:
+                print(f"[scrape] HTTP {r.status_code} {url}")
+                return None
+            return r.text
+    except httpx.HTTPError as e:
+        print(f"[scrape] http error {url}: {e}")
+        return None
+
+def parse_jsonld_listings(html: str, base_url: str, source: str) -> List[Listing]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[Listing] = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            import json
+            data = json.loads(script.string or "null")
+        except Exception:
+            continue
+        # normaliza a lista
+        items = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = [data]
+        else:
+            continue
+        for it in items:
+            try:
+                # RealEstateListing / Product / Offer
+                name = str(it.get("name") or it.get("headline") or it.get("description") or "").strip()
+                url  = _to_abs(base_url, str(it.get("url") or ""))
+                # price
+                price = 0.0
+                offers = it.get("offers")
+                if isinstance(offers, dict):
+                    price = _parse_price(str(offers.get("price") or offers.get("priceSpecification", {}).get("price") or ""))
+                elif isinstance(offers, list) and offers:
+                    price = _parse_price(str(offers[0].get("price") or ""))
+                else:
+                    price = _parse_price(name)
+
+                # address
+                addr = it.get("address") or {}
+                locality = None
+                if isinstance(addr, dict):
+                    locality = addr.get("addressLocality") or addr.get("addressRegion") or addr.get("streetAddress")
+                elif isinstance(addr, str):
+                    locality = addr
+
+                # image
+                img = it.get("image")
+                photos: List[str] = []
+                if isinstance(img, list):
+                    photos = [ _to_abs(base_url, x) for x in img if isinstance(x, str) ]
+                elif isinstance(img, str):
+                    photos = [ _to_abs(base_url, img) ]
+
+                # type guess / rooms
+                fulltext = json.dumps(it, ensure_ascii=False).lower()
+                ltype = _infer_type(name + " " + fulltext)
+                beds  = _beds(fulltext)
+                baths = _baths(fulltext)
+
+                out.append(Listing(
+                    id=f"{source}-jsonld-{len(out)}",
+                    title=name or "Propiedad",
+                    price=price,
+                    currency="MXN",
+                    bedrooms=beds,
+                    bathrooms=baths,
+                    type=ltype,
+                    furnished=None,
+                    location_city=locality,
+                    location_colonia=None,
+                    url=url or base_url,
+                    source=source,
+                    photos=photos,
+                ))
+            except Exception:
+                continue
+    return out
+
+def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[Listing] = []
+
+    # Heurística: encontrar enlaces a detalles de propiedad (contienen /propiedad, /propiedades, /property)
+    anchors = soup.select('a[href*="propiedad"], a[href*="propiedades"], a[href*="property"]')
+    seen = set()
+    for a in anchors[: MAX_CARDS * 3]:  # amplio porque filtramos duplicados
+        href = a.get("href") or ""
+        abs_url = _to_abs(base_url, href)
+        if not abs_url or abs_url in seen: continue
+        seen.add(abs_url)
+
+        # subimos al contenedor de la tarjeta
+        card = a
+        for _ in range(4):
+            if card and (card.select_one("img") or card.select_one(".price, .precio") or card.select_one(".location, .ubicacion")):
+                break
+            card = card.parent
+
+        # título
+        title = (a.get_text(strip=True) or "").strip()
+        if not title:
+            h = None
+            for sel in ["h3", "h2", ".card-title", ".titulo", ".title"]:
+                h = card.select_one(sel) if card else None
+                if h: break
+            if h: title = h.get_text(strip=True)
+
+        # precio
+        price_text = ""
+        price_node = None
+        if card:
+            for cand in [card.select_one(".price"), card.select_one(".precio")]:
+                if cand:
+                    price_node = cand
+                    break
+        if price_node:
+            price_text = price_node.get_text(strip=True)
+        else:
+            # busca cualquier texto con $
+            if card:
+                t = card.get_text(" ", strip=True)
+                m = re.search(r"\$\s*[\d.,\s]+", t)
+                if m: price_text = m.group(0)
+
+        # ubicación
+        loc_text = ""
+        if card:
+            for cand in [card.select_one(".location"), card.select_one(".ubicacion")]:
+                if cand:
+                    loc_text = cand.get_text(strip=True)
+                    break
+
+        # imagen
+        photo_url = None
+        if card:
+            img = card.select_one("img")
+            if img and img.get("src"):
+                photo_url = _to_abs(base_url, img["src"])
+
+        # normalizar
+        price = _parse_price(price_text)
+        city, colonia = _split_city_colonia(loc_text)
+        ltype = _infer_type(title + " " + loc_text)
+        beds = _beds(title + " " + loc_text)
+        baths = _baths(title + " " + loc_text)
+
+        out.append(Listing(
+            id=f"{source}-card-{len(out)}",
+            title=title or "Propiedad",
+            price=price,
+            currency="MXN",
+            bedrooms=beds,
+            bathrooms=baths,
+            type=ltype,
+            furnished=None,
+            location_city=city,
+            location_colonia=colonia,
+            url=abs_url,
+            source=source,
+            photos=[photo_url] if photo_url else [],
+        ))
+
+        if len(out) >= MAX_CARDS:
+            break
+
+    return out
+
+async def scrape_generic_list(url: str, source: str) -> List[Listing]:
+    cache_key = f"scrape::{source}::{url}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    html = await fetch_html(url)
+    if not html:
+        return []
+
+    # 1) JSON-LD primero
+    items = parse_jsonld_listings(html, base_url=_to_abs(url, ""), source=source)
+    # 2) Si no alcanzó, intenta heurística de tarjetas
+    if len(items) < 5:
+        items += parse_cards_heuristic(html, base_url=_to_abs(url, ""), source=source)
+
+    # dedupe por URL
+    dedup: Dict[str, Listing] = {}
+    for it in items:
+        if it.url and it.url not in dedup:
+            dedup[it.url] = it
+    out = list(dedup.values())[:MAX_CARDS]
+
+    if out:
+        CACHE.set(cache_key, out, ttl_seconds=TTL_SECONDS)
+    return out
+
+# =========================
+# Adapters (demo + sitios)
 # =========================
 async def adapter_demo() -> List[Listing]:
     await asyncio.sleep(0.01)
     return [
         Listing(
-            id="demo1",
-            title="Depto 2 rec Col. Primavera",
-            price=9000,
-            bedrooms=2,
-            bathrooms=1,
-            type="departamento",
-            furnished=False,
-            location_city="Tampico",
-            location_colonia="Primavera",
-            url="https://ejemplo.local/depto-primavera",
-            source="demo",
-            photos=[],
-        ),
+            id="demo1", title="Depto 2 rec Col. Primavera", price=9000,
+            bedrooms=2, bathrooms=1, type="departamento", furnished=False,
+            location_city="Tampico", location_colonia="Primavera",
+            url="https://ejemplo.local/depto-primavera", source="demo", photos=[]),
         Listing(
-            id="demo2",
-            title="Casa 3 rec Col. Del Bosque",
-            price=18000,
-            bedrooms=3,
-            bathrooms=2,
-            type="casa",
-            furnished=None,
-            location_city="Tampico",
-            location_colonia="Del Bosque",
-            url="https://ejemplo.local/casa-bosque",
-            source="demo",
-            photos=[],
-        ),
+            id="demo2", title="Casa 3 rec Col. Del Bosque", price=18000,
+            bedrooms=3, bathrooms=2, type="casa",
+            location_city="Tampico", location_colonia="Del Bosque",
+            url="https://ejemplo.local/casa-bosque", source="demo", photos=[]),
         Listing(
-            id="demo3",
-            title="Local comercial Centro",
-            price=12000,
-            bedrooms=None,
-            bathrooms=1,
-            type="local",
-            furnished=False,
-            location_city="Ciudad Madero",
-            location_colonia="Centro",
-            url="https://ejemplo.local/local-centro",
-            source="demo",
-            photos=[],
-        ),
+            id="demo3", title="Local comercial Centro", price=12000,
+            bedrooms=None, bathrooms=1, type="local", furnished=False,
+            location_city="Ciudad Madero", location_colonia="Centro",
+            url="https://ejemplo.local/local-centro", source="demo", photos=[]),
     ]
 
-# Stubs de otras fuentes (agregaremos lógica real después)
-# ===== Adapter: REMAX =====
-# Configura la URL del feed con una variable de entorno en Render: REMAX_FEED_URL
-REMAX_FEED_URL = os.getenv("REMAX_FEED_URL", "").strip()
+# Mapa de sitios → URL de listado "obvia" (ajustable)
+SITES: Dict[str, str] = {
+    "remax":                    "https://remax.com.mx/propiedades",
+    "aysainmobiliaria":        "https://www.aysainmobiliaria.com.mx/",               # revisar subruta de propiedades
+    "cuvier":                  "https://cuvierbienesraices.inmo.co/",               # suele tener /propiedades
+    "suma":                    "https://www.sumabienes.com/",                       # revisar /propiedades /listings
+    "orva":                    "https://www.orvabienes.com.mx/Propiedades",
+    "elizondo":                "https://www.elizondoinmuebles.com/",                # ajustar a catálogo
+    "irles":                   "https://irles.mx/",                                 # ajustar
+    "monteforte":              "https://www.monteforte.com.mx/",                    # ajustar
+    "torres":                  "https://www.torresbienesraices.com/",               # ajustar
+    "altara":                  "https://www.altararealestate.com/",                 # ajustar
+    "altarainmobiliaria":      "https://www.altaraminmobiliaria.com/",              # ajustar
+    "prourbe":                 "https://www.prourbe.mx/",                           # ajustar
+    "inmobiliariaentampico":   "https://www.inmobiliariaentampico.com/",            # ajustar
+    "elite":                   "https://www.bienesraiceselite.com.mx/",             # ajustar
+    "leemar":                  "https://www.leemar.mx/",                             # ajustar
+    "logica":                  "https://www.logicainmobiliaria.com.mx/",            # ajustar
+    "realestatetampico":       "https://www.realestatetampico.com/",                # ajustar
+    "3a":                      "https://www.3ainmobiliaria.mx/Propiedades",
+    "inmobiliarialm":          "https://inmobiliarialm.com/",                        # ajustar
+    "asesoresinmobiliarioss":  "https://www.asesoresinmobiliarioss.com/",           # ajustar
+    "gdinmobiliarias":         "https://www.gdinmobiliarias.com/",                  # ajustar
+    "neolife":                 "https://www.neolifeinmobiliaria.com/",              # ajustar
+    "gestion365":              "https://www.gestioninmobiliaria365.com/",           # ajustar
+}
 
-async def adapter_remax() -> List[Listing]:
-    if not REMAX_FEED_URL:
-        # Sin URL configurada, no devolvemos nada (así no truena)
-        return []
+# Adaptadores que llaman al motor genérico (uno por sitio)
+async def adapter_site(key: str) -> List[Listing]:
+    url = SITES.get(key)
+    if not url: return []
+    return await scrape_generic_list(url, source=key)
 
-    cache_key = f"remax::{REMAX_FEED_URL}"
-    cached = CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+# Creamos funciones concretas para cada clave (por claridad)
+async def adapter_remax() -> List[Listing]:                   return await adapter_site("remax")
+async def adapter_aysainmobiliaria() -> List[Listing]:        return await adapter_site("aysainmobiliaria")
+async def adapter_cuvier() -> List[Listing]:                  return await adapter_site("cuvier")
+async def adapter_suma() -> List[Listing]:                    return await adapter_site("suma")
+async def adapter_orva() -> List[Listing]:                    return await adapter_site("orva")
+async def adapter_elizondo() -> List[Listing]:                return await adapter_site("elizondo")
+async def adapter_irles() -> List[Listing]:                   return await adapter_site("irles")
+async def adapter_monteforte() -> List[Listing]:              return await adapter_site("monteforte")
+async def adapter_torres() -> List[Listing]:                  return await adapter_site("torres")
+async def adapter_altara() -> List[Listing]:                  return await adapter_site("altara")
+async def adapter_altarainmobiliaria() -> List[Listing]:      return await adapter_site("altarainmobiliaria")
+async def adapter_prourbe() -> List[Listing]:                 return await adapter_site("prourbe")
+async def adapter_inmobiliariaentampico() -> List[Listing]:   return await adapter_site("inmobiliariaentampico")
+async def adapter_elite() -> List[Listing]:                   return await adapter_site("elite")
+async def adapter_leemar() -> List[Listing]:                  return await adapter_site("leemar")
+async def adapter_logica() -> List[Listing]:                  return await adapter_site("logica")
+async def adapter_realestatetampico() -> List[Listing]:       return await adapter_site("realestatetampico")
+async def adapter_3a() -> List[Listing]:                      return await adapter_site("3a")
+async def adapter_inmobiliarialm() -> List[Listing]:          return await adapter_site("inmobiliarialm")
+async def adapter_asesoresinmobiliarioss() -> List[Listing]:  return await adapter_site("asesoresinmobiliarioss")
+async def adapter_gdinmobiliarias() -> List[Listing]:         return await adapter_site("gdinmobiliarias")
+async def adapter_neolife() -> List[Listing]:                 return await adapter_site("neolife")
+async def adapter_gestion365() -> List[Listing]:              return await adapter_site("gestion365")
 
-    # Llamada HTTP
-    async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "InmoAgg/0.2.4"}) as client:
-        resp = await client.get(REMAX_FEED_URL, follow_redirects=True)
-        resp.raise_for_status()
-        data = resp.json()  # suponemos que tu feed devuelve JSON
-
-    # Esperamos una estructura tipo:
-    # [
-    #   {
-    #     "id": "abc123",
-    #     "title": "Casa en Del Bosque",
-    #     "price": 17500,
-    #     "currency": "MXN",
-    #     "bedrooms": 3,
-    #     "bathrooms": 2,
-    #     "type": "casa",
-    #     "furnished": false,
-    #     "city": "Tampico",
-    #     "colonia": "Del Bosque",
-    #     "url": "https://.../propiedad/abc123",
-    #     "photos": ["https://.../foto1.jpg", "..."]
-    #   },
-    #   ...
-    # ]
-
-    listings: List[Listing] = []
-    for i, it in enumerate(data if isinstance(data, list) else []):
-        try:
-            listings.append(Listing(
-                id=str(it.get("id") or f"remax-{i}"),
-                title=str(it.get("title") or "Propiedad"),
-                price=float(it.get("price") or 0),
-                currency=str(it.get("currency") or "MXN"),
-                bedrooms=it.get("bedrooms"),
-                bathrooms=it.get("bathrooms"),
-                type=str(it.get("type") or "otro").lower(),
-                furnished=it.get("furnished"),
-                location_city=it.get("city"),
-                location_colonia=it.get("colonia"),
-                url=str(it.get("url") or ""),
-                source="remax",
-                photos=[p for p in (it.get("photos") or []) if isinstance(p, str)],
-            ))
-        except Exception:
-            # Si una fila viene chueca, la saltamos para que no se caiga todo
-            continue
-
-    # Guarda en caché 5 minutos
-    CACHE.set(cache_key, listings, ttl_seconds=300)
-    return listings
-
-async def adapter_alemar() -> List[Listing]: return []
-async def adapter_inmuebles24() -> List[Listing]: return []
-
-# =========================
-# Registro y búsqueda
-# =========================
+# Registro de adapters
 ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
     "demo": adapter_demo,
     "remax": adapter_remax,
-    "alemar": adapter_alemar,
-    "inmuebles24": adapter_inmuebles24,
+    "aysainmobiliaria": adapter_aysainmobiliaria,
+    "cuvier": adapter_cuvier,
+    "suma": adapter_suma,
+    "orva": adapter_orva,
+    "elizondo": adapter_elizondo,
+    "irles": adapter_irles,
+    "monteforte": adapter_monteforte,
+    "torres": adapter_torres,
+    "altara": adapter_altara,
+    "altarainmobiliaria": adapter_altarainmobiliaria,
+    "prourbe": adapter_prourbe,
+    "inmobiliariaentampico": adapter_inmobiliariaentampico,
+    "elite": adapter_elite,
+    "leemar": adapter_leemar,
+    "logica": adapter_logica,
+    "realestatetampico": adapter_realestatetampico,
+    "3a": adapter_3a,
+    "inmobiliarialm": adapter_inmobiliarialm,
+    "asesoresinmobiliarioss": adapter_asesoresinmobiliarioss,
+    "gdinmobiliarias": adapter_gdinmobiliarias,
+    "neolife": adapter_neolife,
+    "gestion365": adapter_gestion365,
 }
 
+# =========================
+# Búsqueda (mismo contrato que ya tenías)
+# =========================
 class SearchRequest(BaseModel):
-    # Alineado con tu openapi.yaml (snake_case)
-    cities: Optional[List[str]] = None            # ["Tampico","Ciudad Madero"]
+    cities: Optional[List[str]] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
     min_bedrooms: Optional[int] = None
     furnished: Optional[bool] = None
-    property_types: Optional[List[str]] = None    # ["casa","departamento","local",...]
-    q: Optional[str] = None                       # texto libre en título
-    sources: Optional[List[str]] = None           # ["demo","remax",...]
+    property_types: Optional[List[str]] = None
+    q: Optional[str] = None
+    sources: Optional[List[str]] = None
     offset: int = 0
     limit: int = 25
 
 def _csv_to_list(s: Optional[str]) -> Optional[List[str]]:
-    if not s:
-        return None
+    if not s: return None
     return [x.strip() for x in s.split(",") if x.strip()]
 
 async def _collect_sources(sources: Optional[List[str]]) -> List[Listing]:
     keys = sources if sources else list(ADAPTERS.keys())
     tasks = [ADAPTERS[k]() for k in keys if k in ADAPTERS]
-    if not tasks:
-        return []
+    if not tasks: return []
     groups = await asyncio.gather(*tasks)
     out: List[Listing] = []
     for g in groups:
@@ -220,35 +478,24 @@ async def _collect_sources(sources: Optional[List[str]]) -> List[Listing]:
     return out
 
 def _passes_filters(l: Listing, q: SearchRequest) -> bool:
-    # cities
     if q.cities:
-        cities_lc = {c.lower() for c in q.cities}
-        if (l.location_city or "").lower() not in cities_lc:
+        if (l.location_city or "").lower() not in {c.lower() for c in q.cities}:
             return False
-    # price
-    if q.min_price is not None and l.price < q.min_price:
-        return False
-    if q.max_price is not None and l.price > q.max_price:
-        return False
-    # bedrooms (solo para casa/departamento)
+    if q.min_price is not None and l.price < q.min_price: return False
+    if q.max_price is not None and l.price > q.max_price: return False
     if q.min_bedrooms is not None:
         tipo = (l.type or "").lower()
         if tipo in {"casa", "departamento", "depto"}:
             if l.bedrooms is None or l.bedrooms < q.min_bedrooms:
                 return False
-    # furnished
     if q.furnished is not None:
         if l.furnished is None or l.furnished is not q.furnished:
             return False
-    # property_types
     if q.property_types:
-        tipos = {t.lower() for t in q.property_types}
-        if (l.type or "").lower() not in tipos:
+        if (l.type or "").lower() not in {t.lower() for t in q.property_types}:
             return False
-    # q en título
-    if q.q:
-        if q.q.lower() not in (l.title or "").lower():
-            return False
+    if q.q and q.q.lower() not in (l.title or "").lower():
+        return False
     return True
 
 async def _search_core(q: SearchRequest) -> SearchResponse:
@@ -263,7 +510,6 @@ async def _search_core(q: SearchRequest) -> SearchResponse:
 # =========================
 # Endpoints
 # =========================
-# GET /search (tal como en tu openapi.yaml)
 @app.get("/search", response_model=SearchResponse)
 async def search_get(
     cities: Optional[str] = Query(None, description="CSV de ciudades"),
@@ -273,7 +519,7 @@ async def search_get(
     furnished: Optional[bool] = Query(None),
     property_types: Optional[str] = Query(None, description="CSV de tipos"),
     q: Optional[str] = Query(None),
-    sources: Optional[str] = Query(None, description="CSV de fuentes"),
+    sources: Optional[str] = Query(None, description="CSV de fuentes (demo,remax,...)"),
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
@@ -291,7 +537,6 @@ async def search_get(
     )
     return await _search_core(req)
 
-# Alias opcionales por compatibilidad si alguna acción vieja los llama:
 @app.get("/search-listings", response_model=SearchResponse)
 async def search_listings_alias(**kwargs):
     return await search_get(**kwargs)
@@ -300,30 +545,6 @@ async def search_listings_alias(**kwargs):
 async def searchListings_alias(**kwargs):
     return await search_get(**kwargs)
 
-# POST /search (por si quieres mandar JSON en vez de querystring)
 @app.post("/search", response_model=SearchResponse)
 async def search_post(req: SearchRequest):
     return await _search_core(req)
-
-# CACHETITO
-import os, time, httpx
-
-# ===== Cache simple (TTL) =====
-class SimpleCache:
-    def __init__(self):
-        self.data = {}  # key -> (expiry_ts, value)
-
-    def get(self, key: str):
-        item = self.data.get(key)
-        if not item:
-            return None
-        expiry, value = item
-        if time.time() > expiry:
-            self.data.pop(key, None)
-            return None
-        return value
-
-    def set(self, key: str, value, ttl_seconds: int = 300):
-        self.data[key] = (time.time() + ttl_seconds, value)
-
-CACHE = SimpleCache()
