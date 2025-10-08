@@ -9,6 +9,16 @@ from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
 
 # =========================
+# Config (ajustable por env)
+# =========================
+APP_VERSION = "0.3.2"
+TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")     # cache 5 min
+MAX_CARDS   = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
+ADAPTER_TIMEOUT = float(os.getenv("ADAPTER_TIMEOUT_SECONDS", "8"))     # tiempo máx por sitio
+CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "4") or "4")    # sitios en paralelo
+DEFAULT_SOURCES = os.getenv("DEFAULT_SOURCES", "demo")                 # por defecto solo demo
+
+# =========================
 # Modelos
 # =========================
 class Listing(BaseModel):
@@ -34,7 +44,7 @@ class SearchResponse(BaseModel):
 # =========================
 # App
 # =========================
-app = FastAPI(title="Inmo Aggregator", version="0.3.1")
+app = FastAPI(title="Inmo Aggregator", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -43,9 +53,8 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"service": "Inmo Aggregator", "status": "ok", "version": "0.3.1"}
+    return {"service": "Inmo Aggregator", "status": "ok", "version": APP_VERSION}
 
-# Render hace HEAD /; respondemos 200 para evitar 405 en logs
 @app.head("/", include_in_schema=False)
 def root_head():
     return Response(status_code=200)
@@ -72,8 +81,7 @@ class SimpleCache:
         self.data[key] = (time.time() + ttl_seconds, value)
 
 CACHE = SimpleCache()
-TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")
-MAX_CARDS   = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
+SEM = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 # =========================
 # Utilidades de scraping
@@ -137,15 +145,19 @@ def _split_city_colonia(loc_text: str) -> Tuple[Optional[str], Optional[str]]:
     colonia = parts[0] if len(parts) >= 2 else None
     return (city, colonia)
 
+def _httpx_timeout():
+    # timeouts agresivos para no colgarnos
+    return httpx.Timeout(connect=4.0, read=4.0, write=4.0, pool=4.0)
+
 async def fetch_html(url: str) -> Optional[str]:
     try:
-        async with httpx.AsyncClient(timeout=25.0, headers={"User-Agent": "InmoAgg/0.3.1"}) as client:
+        async with httpx.AsyncClient(timeout=_httpx_timeout(), headers={"User-Agent": f"InmoAgg/{APP_VERSION}"}) as client:
             r = await client.get(url, follow_redirects=True)
             if r.status_code != 200:
                 print(f"[scrape] HTTP {r.status_code} {url}")
                 return None
             return r.text
-    except httpx.HTTPError as e:
+    except Exception as e:
         print(f"[scrape] http error {url}: {e}")
         return None
 
@@ -222,7 +234,7 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
             continue
         seen.add(abs_url)
 
-        # sube a contenedor de tarjeta
+        # subir a contenedor de tarjeta
         card = a
         for _ in range(6):
             if not card or getattr(card, "name", "").lower() in ("body","html"):
@@ -318,6 +330,7 @@ async def scrape_generic_list(url: str, source: str) -> List[Listing]:
     if len(items) < 5:
         items += parse_cards_heuristic(html, base_url=_to_abs(url,""), source=source)
 
+    # dedupe por URL
     dedup: Dict[str, Listing] = {}
     for it in items:
         if it.url and it.url not in dedup:
@@ -329,7 +342,7 @@ async def scrape_generic_list(url: str, source: str) -> List[Listing]:
     return out
 
 # =========================
-# RE/MAX: descubrimiento por sitemap + detalle
+# RE/MAX: sitemap + detalle (fallback)
 # =========================
 async def remax_discover_detail_urls(max_urls: int = 40) -> List[str]:
     roots = ["https://remax.com.mx/sitemap.xml"]
@@ -338,7 +351,7 @@ async def remax_discover_detail_urls(max_urls: int = 40) -> List[str]:
 
     async def fetch_text(url: str) -> Optional[str]:
         try:
-            async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "InmoAgg/0.3.1"}) as c:
+            async with httpx.AsyncClient(timeout=_httpx_timeout(), headers={"User-Agent": f"InmoAgg/{APP_VERSION}"}) as c:
                 r = await c.get(url, follow_redirects=True)
                 if r.status_code != 200:
                     print(f"[remax] sitemap HTTP {r.status_code}: {url}")
@@ -509,15 +522,15 @@ async def adapter_site(key: str) -> List[Listing]:
 
 async def adapter_remax() -> List[Listing]:
     try:
-        base_list_url = "https://remax.com.mx/propiedades"
+        base_list_url = SITES["remax"]
+        # Intento rápido de lista
         cards = await scrape_generic_list(base_list_url, source="remax")
         if cards:
             return cards
-
+        # Fallback: sitemap → detalle
         detail_urls = await remax_discover_detail_urls(max_urls=40)
         if not detail_urls:
             return []
-
         listings: List[Listing] = []
         for i, u in enumerate(detail_urls):
             if len(listings) >= MAX_CARDS:
@@ -525,12 +538,9 @@ async def adapter_remax() -> List[Listing]:
             html = await fetch_html(u)
             if not html:
                 continue
-            item = extract_from_property_detail(
-                html, base_url="https://remax.com.mx", source="remax", url=u, idx=i
-            )
+            item = extract_from_property_detail(html, base_url="https://remax.com.mx", source="remax", url=u, idx=i)
             if item:
                 listings.append(item)
-
         if listings:
             CACHE.set("scrape::remax::fallback", listings, ttl_seconds=TTL_SECONDS)
         return listings
@@ -538,7 +548,7 @@ async def adapter_remax() -> List[Listing]:
         print(f"[remax] adapter error suprimido: {e}")
         return []
 
-# Wrappers para el resto de sitios
+# Wrappers para el resto
 async def adapter_aysainmobiliaria() -> List[Listing]:        return await adapter_site("aysainmobiliaria")
 async def adapter_cuvier() -> List[Listing]:                  return await adapter_site("cuvier")
 async def adapter_suma() -> List[Listing]:                    return await adapter_site("suma")
@@ -562,7 +572,7 @@ async def adapter_gdinmobiliarias() -> List[Listing]:         return await adapt
 async def adapter_neolife() -> List[Listing]:                 return await adapter_site("neolife")
 async def adapter_gestion365() -> List[Listing]:              return await adapter_site("gestion365")
 
-# Registro
+# Registro de adapters
 ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
     "demo": adapter_demo,
     "remax": adapter_remax,
@@ -591,7 +601,7 @@ ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
 }
 
 # =========================
-# Búsqueda
+# Búsqueda y control de tiempo
 # =========================
 class SearchRequest(BaseModel):
     cities: Optional[List[str]] = None
@@ -609,17 +619,28 @@ def _csv_to_list(s: Optional[str]) -> Optional[List[str]]:
     if not s: return None
     return [x.strip() for x in s.split(",") if x.strip()]
 
+async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listing]]]) -> List[Listing]:
+    # Limitar concurrencia + timeout por sitio
+    async with SEM:
+        try:
+            return await asyncio.wait_for(fn(), timeout=ADAPTER_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"[adapter:{key}] timeout > {ADAPTER_TIMEOUT}s")
+            return []
+        except Exception as e:
+            print(f"[adapter:{key}] error suprimido: {e}")
+            return []
+
 async def _collect_sources(sources: Optional[List[str]]) -> List[Listing]:
-    keys = sources if sources else list(ADAPTERS.keys())
-    tasks = [ADAPTERS[k]() for k in keys if k in ADAPTERS]
-    if not tasks: return []
-    groups = await asyncio.gather(*tasks, return_exceptions=True)
+    # Por defecto, SOLO demo (para que nunca se cuelgue si no se pasan sources)
+    keys = sources if sources else [s.strip() for s in DEFAULT_SOURCES.split(",") if s.strip()]
+    tasks = [asyncio.create_task(_run_adapter(k, ADAPTERS[k])) for k in keys if k in ADAPTERS]
+    if not tasks: 
+        return []
+    results = await asyncio.gather(*tasks, return_exceptions=False)
     out: List[Listing] = []
-    for g in groups:
-        if isinstance(g, Exception):
-            print(f"[adapter] error suprimido: {g}")
-            continue
-        out.extend(g)
+    for res in results:
+        out.extend(res)
     return out
 
 def _passes_filters(l: Listing, q: SearchRequest) -> bool:
