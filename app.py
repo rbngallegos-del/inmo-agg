@@ -110,7 +110,71 @@ async def adapter_demo() -> List[Listing]:
     ]
 
 # Stubs de otras fuentes (agregaremos lógica real después)
-async def adapter_remax() -> List[Listing]: return []
+# ===== Adapter: REMAX =====
+# Configura la URL del feed con una variable de entorno en Render: REMAX_FEED_URL
+REMAX_FEED_URL = os.getenv("REMAX_FEED_URL", "").strip()
+
+async def adapter_remax() -> List[Listing]:
+    if not REMAX_FEED_URL:
+        # Sin URL configurada, no devolvemos nada (así no truena)
+        return []
+
+    cache_key = f"remax::{REMAX_FEED_URL}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Llamada HTTP
+    async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "InmoAgg/0.2.4"}) as client:
+        resp = await client.get(REMAX_FEED_URL, follow_redirects=True)
+        resp.raise_for_status()
+        data = resp.json()  # suponemos que tu feed devuelve JSON
+
+    # Esperamos una estructura tipo:
+    # [
+    #   {
+    #     "id": "abc123",
+    #     "title": "Casa en Del Bosque",
+    #     "price": 17500,
+    #     "currency": "MXN",
+    #     "bedrooms": 3,
+    #     "bathrooms": 2,
+    #     "type": "casa",
+    #     "furnished": false,
+    #     "city": "Tampico",
+    #     "colonia": "Del Bosque",
+    #     "url": "https://.../propiedad/abc123",
+    #     "photos": ["https://.../foto1.jpg", "..."]
+    #   },
+    #   ...
+    # ]
+
+    listings: List[Listing] = []
+    for i, it in enumerate(data if isinstance(data, list) else []):
+        try:
+            listings.append(Listing(
+                id=str(it.get("id") or f"remax-{i}"),
+                title=str(it.get("title") or "Propiedad"),
+                price=float(it.get("price") or 0),
+                currency=str(it.get("currency") or "MXN"),
+                bedrooms=it.get("bedrooms"),
+                bathrooms=it.get("bathrooms"),
+                type=str(it.get("type") or "otro").lower(),
+                furnished=it.get("furnished"),
+                location_city=it.get("city"),
+                location_colonia=it.get("colonia"),
+                url=str(it.get("url") or ""),
+                source="remax",
+                photos=[p for p in (it.get("photos") or []) if isinstance(p, str)],
+            ))
+        except Exception:
+            # Si una fila viene chueca, la saltamos para que no se caiga todo
+            continue
+
+    # Guarda en caché 5 minutos
+    CACHE.set(cache_key, listings, ttl_seconds=300)
+    return listings
+
 async def adapter_alemar() -> List[Listing]: return []
 async def adapter_inmuebles24() -> List[Listing]: return []
 
@@ -238,3 +302,26 @@ async def searchListings_alias(**kwargs):
 @app.post("/search", response_model=SearchResponse)
 async def search_post(req: SearchRequest):
     return await _search_core(req)
+
+# CACHETITO
+import os, time, httpx
+
+# ===== Cache simple (TTL) =====
+class SimpleCache:
+    def __init__(self):
+        self.data = {}  # key -> (expiry_ts, value)
+
+    def get(self, key: str):
+        item = self.data.get(key)
+        if not item:
+            return None
+        expiry, value = item
+        if time.time() > expiry:
+            self.data.pop(key, None)
+            return None
+        return value
+
+    def set(self, key: str, value, ttl_seconds: int = 300):
+        self.data[key] = (time.time() + ttl_seconds, value)
+
+CACHE = SimpleCache()
