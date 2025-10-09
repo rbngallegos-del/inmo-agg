@@ -9,14 +9,21 @@ from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
 
 # =========================
-# Config (ajustable por env)
+# Config
 # =========================
-APP_VERSION = "0.3.3"
-TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")     # cache 5 min
+APP_VERSION = "0.3.4"
+TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")     # cache positiva (5 min)
+NEG_TTL_SECONDS = int(os.getenv("SCRAPE_NEG_TTL_SECONDS", "120") or "120")  # cache para vacíos/errores (2 min)
 MAX_CARDS   = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
-ADAPTER_TIMEOUT = float(os.getenv("ADAPTER_TIMEOUT_SECONDS", "8"))     # tiempo máx por sitio
-CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "4") or "4")    # sitios en paralelo
-DEFAULT_SOURCES = os.getenv("DEFAULT_SOURCES", "demo")                 # por defecto solo demo
+ADAPTER_TIMEOUT = float(os.getenv("ADAPTER_TIMEOUT_SECONDS", "8"))     # default por sitio
+CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "4") or "4")
+DEFAULT_SOURCES = os.getenv("DEFAULT_SOURCES", "demo")
+
+# timeouts específicos por sitio (segundos)
+SITE_TIMEOUTS: Dict[str, float] = {
+    "remax": 15.0,   # darle aire por sitemap + detalle
+    # puedes ajustar otros aquí si hace falta
+}
 
 # =========================
 # Modelos
@@ -64,7 +71,7 @@ def health():
     return {"ok": True}
 
 # =========================
-# Cache simple (TTL)
+# Cache simple (TTL + neg-cache)
 # =========================
 class SimpleCache:
     def __init__(self):
@@ -82,6 +89,16 @@ class SimpleCache:
 
 CACHE = SimpleCache()
 SEM = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+def cache_get_pos_or_neg(key: str):
+    return CACHE.get(key)
+
+def cache_set_pos(key: str, value):
+    if value:
+        CACHE.set(key, value, ttl_seconds=TTL_SECONDS)
+    else:
+        # cachear vacío por poco tiempo para no repetir intentos fallidos
+        CACHE.set(key, [], ttl_seconds=NEG_TTL_SECONDS)
 
 # =========================
 # Utilidades de scraping
@@ -145,13 +162,14 @@ def _split_city_colonia(loc_text: str) -> Tuple[Optional[str], Optional[str]]:
     colonia = parts[0] if len(parts) >= 2 else None
     return (city, colonia)
 
-def _httpx_timeout():
-    # timeouts agresivos para no colgarnos
-    return httpx.Timeout(connect=4.0, read=4.0, write=4.0, pool=4.0)
+def _httpx_timeout(read: float = 4.0):
+    # timeouts agresivos por defecto
+    return httpx.Timeout(connect=4.0, read=read, write=4.0, pool=4.0)
 
-async def fetch_html(url: str) -> Optional[str]:
+async def fetch_html(url: str, read_timeout: float = 4.0) -> Optional[str]:
     try:
-        async with httpx.AsyncClient(timeout=_httpx_timeout(), headers={"User-Agent": f"InmoAgg/{APP_VERSION}"}) as client:
+        async with httpx.AsyncClient(timeout=_httpx_timeout(read=read_timeout),
+                                     headers={"User-Agent": f"InmoAgg/{APP_VERSION}"}) as client:
             r = await client.get(url, follow_redirects=True)
             if r.status_code != 200:
                 print(f"[scrape] HTTP {r.status_code} {url}")
@@ -217,8 +235,7 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
     soup = BeautifulSoup(html, "html.parser")
     out: List[Listing] = []
 
-    # Estricto: solo enlaces de DETALLE (evitar CTAs tipo /propiedades)
-    anchors = soup.select('a[href*="/propiedad/"]')
+    anchors = soup.select('a[href*="/propiedad/"]')  # detalle solamente
     seen = set()
 
     def is_bad_title(t: str) -> bool:
@@ -234,7 +251,6 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
             continue
         seen.add(abs_url)
 
-        # subir a contenedor de tarjeta
         card = a
         for _ in range(6):
             if not card or getattr(card, "name", "").lower() in ("body","html"):
@@ -244,7 +260,6 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
                 break
             card = card.parent
 
-        # título
         title = (a.get_text(strip=True) or "").strip()
         if is_bad_title(title):
             h = None
@@ -256,7 +271,6 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
         if is_bad_title(title):
             continue
 
-        # precio
         price_text = ""
         price_node = None
         if card:
@@ -273,7 +287,6 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
             if m: price_text = m.group(0)
         price = _parse_price(price_text)
 
-        # ubicación
         loc_text = ""
         if card:
             for sel in [".location",".ubicacion","[class*='ubicacion']","[class*='location']"]:
@@ -283,7 +296,6 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
                     break
         city, colonia = _split_city_colonia(loc_text)
 
-        # imagen
         photo_url = None
         if card:
             img = card.select_one("img")
@@ -316,35 +328,34 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
 
     return out
 
-async def scrape_generic_list(url: str, source: str) -> List[Listing]:
+async def scrape_generic_list(url: str, source: str, read_timeout: float = 4.0) -> List[Listing]:
     cache_key = f"scrape::{source}::{url}"
-    cached = CACHE.get(cache_key)
+    cached = cache_get_pos_or_neg(cache_key)
     if cached is not None:
         return cached
 
-    html = await fetch_html(url)
+    html = await fetch_html(url, read_timeout=read_timeout)
     if not html:
+        cache_set_pos(cache_key, [])
         return []
 
     items = parse_jsonld_listings(html, base_url=_to_abs(url,""), source=source)
     if len(items) < 5:
         items += parse_cards_heuristic(html, base_url=_to_abs(url,""), source=source)
 
-    # dedupe por URL
     dedup: Dict[str, Listing] = {}
     for it in items:
         if it.url and it.url not in dedup:
             dedup[it.url] = it
     out = list(dedup.values())[:MAX_CARDS]
 
-    if out:
-        CACHE.set(cache_key, out, ttl_seconds=TTL_SECONDS)
+    cache_set_pos(cache_key, out)
     return out
 
 # =========================
-# RE/MAX: sitemap + detalle (fallback con .gz)
+# RE/MAX: sitemap + detalle (con .gz)
 # =========================
-async def remax_discover_detail_urls(max_urls: int = 40, max_sitemaps: int = 10) -> List[str]:
+async def remax_discover_detail_urls(max_urls: int = 24, max_sitemaps: int = 6) -> List[str]:
     roots = ["https://www.remax.com.mx/sitemap.xml"]
     seen = set()
     seen_sitemaps = 0
@@ -352,20 +363,20 @@ async def remax_discover_detail_urls(max_urls: int = 40, max_sitemaps: int = 10)
 
     async def fetch_sitemap(url: str) -> Optional[str]:
         try:
-            async with httpx.AsyncClient(timeout=_httpx_timeout(), headers={"User-Agent": f"InmoAgg/{APP_VERSION}"}) as c:
+            async with httpx.AsyncClient(timeout=_httpx_timeout(read=8.0),
+                                         headers={"User-Agent": f"InmoAgg/{APP_VERSION}"}) as c:
                 r = await c.get(url, follow_redirects=True)
                 if r.status_code != 200:
                     print(f"[remax] sitemap HTTP {r.status_code}: {url}")
                     return None
-                # Si viene comprimido .gz, descomprimir desde r.content
                 content = r.content or b""
                 ct = (r.headers.get("content-type") or "").lower()
                 ce = (r.headers.get("content-encoding") or "").lower()
                 if url.endswith(".gz") or "gzip" in ce or "application/x-gzip" in ct:
                     try:
                         content = gzip.decompress(content)
-                    except Exception as e:
-                        # algunos servers ya lo entregan inflado aunque .gz en URL
+                    except Exception:
+                        # algunos servers ya lo entregan inflado
                         pass
                 try:
                     return content.decode("utf-8", "ignore")
@@ -395,7 +406,6 @@ async def remax_discover_detail_urls(max_urls: int = 40, max_sitemaps: int = 10)
 
         ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-        # sitemapindex → más sitemaps (respetando el límite)
         for sm in root.findall("sm:sitemap", ns):
             loc = sm.find("sm:loc", ns)
             if loc is not None and loc.text and len(queue) + seen_sitemaps < max_sitemaps:
@@ -403,7 +413,6 @@ async def remax_discover_detail_urls(max_urls: int = 40, max_sitemaps: int = 10)
                 if loc_text not in seen:
                     queue.append(loc_text)
 
-        # urlset → URLs de detalle
         for u in root.findall("sm:url", ns):
             loc = u.find("sm:loc", ns)
             if loc is None or not loc.text:
@@ -414,7 +423,7 @@ async def remax_discover_detail_urls(max_urls: int = 40, max_sitemaps: int = 10)
                 if len(found) >= max_urls:
                     break
 
-    # dedupe + límite
+    # dedupe + limite
     uniq: List[str] = []
     seen_u = set()
     for u in found:
@@ -533,7 +542,8 @@ async def adapter_site(key: str) -> List[Listing]:
     url = SITES.get(key)
     if not url: return []
     try:
-        return await scrape_generic_list(url, source=key)
+        # lectura 4s por defecto
+        return await scrape_generic_list(url, source=key, read_timeout=4.0)
     except Exception as e:
         print(f"[{key}] adapter error suprimido: {e}")
         return []
@@ -541,26 +551,25 @@ async def adapter_site(key: str) -> List[Listing]:
 async def adapter_remax() -> List[Listing]:
     try:
         base_list_url = SITES["remax"]
-        # Intento rápido de lista
-        cards = await scrape_generic_list(base_list_url, source="remax")
+        # 1) intento de lista (leer 6s porque a veces hidratan más)
+        cards = await scrape_generic_list(base_list_url, source="remax", read_timeout=6.0)
         if cards:
             return cards
-        # Fallback: sitemap (con .gz) → detalle (limitado)
-        detail_urls = await remax_discover_detail_urls(max_urls=30, max_sitemaps=8)
+        # 2) fallback: sitemap .gz -> detalle
+        detail_urls = await remax_discover_detail_urls(max_urls=24, max_sitemaps=6)
         if not detail_urls:
             return []
         listings: List[Listing] = []
         for i, u in enumerate(detail_urls):
             if len(listings) >= MAX_CARDS:
                 break
-            html = await fetch_html(u)
+            html = await fetch_html(u, read_timeout=8.0)
             if not html:
                 continue
             item = extract_from_property_detail(html, base_url="https://www.remax.com.mx", source="remax", url=u, idx=i)
             if item:
                 listings.append(item)
-        if listings:
-            CACHE.set("scrape::remax::fallback", listings, ttl_seconds=TTL_SECONDS)
+        cache_set_pos("scrape::remax::fallback", listings)
         return listings
     except Exception as e:
         print(f"[remax] adapter error suprimido: {e}")
@@ -590,7 +599,7 @@ async def adapter_gdinmobiliarias() -> List[Listing]:         return await adapt
 async def adapter_neolife() -> List[Listing]:                 return await adapter_site("neolife")
 async def adapter_gestion365() -> List[Listing]:              return await adapter_site("gestion365")
 
-# Registro de adapters
+# Registro
 ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
     "demo": adapter_demo,
     "remax": adapter_remax,
@@ -619,7 +628,7 @@ ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
 }
 
 # =========================
-# Búsqueda y control de tiempo
+# Búsqueda con control de tiempo
 # =========================
 class SearchRequest(BaseModel):
     cities: Optional[List[str]] = None
@@ -639,10 +648,11 @@ def _csv_to_list(s: Optional[str]) -> Optional[List[str]]:
 
 async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listing]]]) -> List[Listing]:
     async with SEM:
+        timeout = SITE_TIMEOUTS.get(key, ADAPTER_TIMEOUT)
         try:
-            return await asyncio.wait_for(fn(), timeout=ADAPTER_TIMEOUT)
+            return await asyncio.wait_for(fn(), timeout=timeout)
         except asyncio.TimeoutError:
-            print(f"[adapter:{key}] timeout > {ADAPTER_TIMEOUT}s")
+            print(f"[adapter:{key}] timeout > {timeout}s")
             return []
         except Exception as e:
             print(f"[adapter:{key}] error suprimido: {e}")
