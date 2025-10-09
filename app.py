@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 # =========================
 # Config
 # =========================
-APP_VERSION = "0.3.8-hotfix"
+APP_VERSION = "0.3.9"
 TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")
 NEG_TTL_SECONDS = int(os.getenv("SCRAPE_NEG_TTL_SECONDS", "120") or "120")
 MAX_CARDS   = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
@@ -22,9 +22,7 @@ DEFAULT_SOURCES = os.getenv("DEFAULT_SOURCES", "demo")
 # Semillas RE/MAX
 REMAX_SEEDS = [u.strip() for u in (os.getenv("REMAX_SEEDS", "https://remax.com.mx/propiedad/642420") or "").split(",") if u.strip()]
 
-SITE_TIMEOUTS: Dict[str, float] = {
-    "remax": 20.0,
-}
+SITE_TIMEOUTS: Dict[str, float] = {"remax": 20.0}
 
 # =========================
 # Modelos
@@ -135,19 +133,27 @@ def _to_abs(base: str, href: str) -> str:
 
 def _parse_price_from_text(text: str) -> float:
     if not text: return 0.0
+    # $ 4,200,000
     m = re.search(r"\$\s*([\d.,\s]+)", text)
     if m:
         try: return float(m.group(1).replace(",", "").replace(" ", ""))
         except: pass
+    # Precio: 4200000 / 4,200,000 MXN / MN
     m = re.search(r"(?:precio|mxn|mn)\s*[:\-]?\s*([\d.,\s]+)", text, re.I)
     if m:
         try: return float(m.group(1).replace(",", "").replace(" ", ""))
         except: pass
+    # genérico
     m = PRICE_RE.search(text.replace(",", ""))
     if m:
         try: return float(m.group(1).replace(" ", ""))
         except: pass
     return 0.0
+
+def _pick_best_price(cands: List[float]) -> float:
+    # filtra valores ridículos y toma el mayor
+    valid = [x for x in cands if x and 10000 <= x <= 200_000_000]
+    return max(valid) if valid else 0.0
 
 def _infer_type(text: str) -> str:
     t = (text or "").lower()
@@ -488,8 +494,27 @@ async def remax_collect_ids_from_indexes(max_urls: int = 30) -> List[str]:
     return out[:max_urls]
 
 def _meta(soup: BeautifulSoup, key: str) -> Optional[str]:
-    tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
+    tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key}) \
+          or soup.find("meta", attrs={"itemprop": key})
     return (tag.get("content") or "").strip() if tag and tag.get("content") else None
+
+def _price_candidates_from_meta(soup: BeautifulSoup) -> List[float]:
+    keys = [
+        "product:price:amount", "og:price:amount", "twitter:data1",
+        "price", "product:price", "product:price:currency"
+    ]
+    out: List[float] = []
+    for k in keys:
+        v = _meta(soup, k)
+        if v:
+            out.append(_parse_price_from_text(v))
+    # Busca itemprop price explícito
+    el = soup.find(attrs={"itemprop": "price"})
+    if el and el.get("content"):
+        out.append(_parse_price_from_text(el.get("content")))
+    if el and el.get_text(strip=True):
+        out.append(_parse_price_from_text(el.get_text(strip=True)))
+    return [x for x in out if x]
 
 def _clean_photos(urls: List[str], base_url: str) -> List[str]:
     out: List[str] = []
@@ -497,7 +522,8 @@ def _clean_photos(urls: List[str], base_url: str) -> List[str]:
         if not u: continue
         absu = _to_abs(base_url, u)
         low = absu.lower()
-        if "facebook.com/tr" in low:  # pixel
+        # Solo fotos de propiedades del CDN; evita íconos y assets generales
+        if "cdn.remax.com.mx/properties/" not in low:
             continue
         if any(low.endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
             if absu not in out:
@@ -505,38 +531,32 @@ def _clean_photos(urls: List[str], base_url: str) -> List[str]:
     return out[:12]
 
 def extract_from_property_detail(html: str, base_url: str, source: str, url: str, idx: int) -> Optional[Listing]:
+    # 1) JSON-LD primero
     items = parse_jsonld_listings(html, base_url=base_url, source=source)
     if items:
         best = sorted(items, key=lambda x: (x.price or 0), reverse=True)[0]
         best.url = url
+        # fotos filtradas
         best.photos = _clean_photos(best.photos, base_url)
-        if not best.location_city:
-            soup_tmp = BeautifulSoup(html, "html.parser")
-            og_title = _meta(soup_tmp, "og:title") or ""
-            city_guess, _ = _split_city_colonia(og_title)
-            if city_guess:
-                best.location_city = city_guess
         return best
 
+    # 2) Metas + heurísticas robustas
     soup = BeautifulSoup(html, "html.parser")
+
+    # Título
     title = _meta(soup, "og:title") or ""
     if not title:
         for sel in ["h1",".title",".titulo","[class*='title']","[class*='titulo']"]:
             h = soup.select_one(sel)
             if h: title = h.get_text(strip=True); break
 
-    price_text = _meta(soup, "product:price:amount") or _meta(soup, "og:price:amount") or ""
-    if not price_text:
-        for sel in [".price",".precio","[class*='price']","[class*='precio']"]:
-            n = soup.select_one(sel)
-            if n and n.get_text(strip=True):
-                price_text = n.get_text(strip=True); break
-    if not price_text:
-        body_text = soup.get_text(" ", strip=True)
-        price_val = _parse_price_from_text(body_text)
-        if price_val > 0:
-            price_text = str(price_val)
+    # Precio: candidatas de metas + texto global; elegimos el mayor válido
+    cand_prices = _price_candidates_from_meta(soup)
+    body_text = soup.get_text(" ", strip=True)
+    cand_prices.append(_parse_price_from_text(body_text))
+    price_val = _pick_best_price(cand_prices)
 
+    # Fotos: solo cdn de propiedades
     photos: List[str] = []
     og_img = _meta(soup, "og:image")
     if og_img: photos.append(og_img)
@@ -544,28 +564,28 @@ def extract_from_property_detail(html: str, base_url: str, source: str, url: str
         if img.get("src"): photos.append(img["src"])
     photos = _clean_photos(photos, base_url)
 
+    # Ciudad/colonia: solo breadcrumbs o addressLocality (nada de og:title)
     city = None; colonia = None
     bc = soup.select("nav.breadcrumb a, .breadcrumb a, [class*='breadcrumb'] a")
     if bc:
         tail = bc[-1].get_text(" ", strip=True)
         c1, c2 = _split_city_colonia(tail)
         city = city or c1; colonia = colonia or c2
-    if not city:
-        c1, c2 = _split_city_colonia(title)
-        city = city or c1; colonia = colonia or c2
 
-    low = soup.get_text(" ", strip=True).lower()
+    # Recámaras/baños por texto
+    low = body_text.lower()
     beds  = _beds(low)
     baths = _baths(low)
+
     ltype = _infer_type((title or "") + " " + low)
 
-    if not title and _parse_price_from_text(price_text) == 0 and not photos:
+    if not title and price_val == 0 and not photos:
         return None
 
     return Listing(
         id=f"{source}-detail-{idx}",
         title=title or "Propiedad",
-        price=_parse_price_from_text(price_text),
+        price=price_val,
         currency="MXN",
         bedrooms=beds,
         bathrooms=baths,
@@ -639,19 +659,23 @@ async def adapter_site(key: str) -> List[Listing]:
 async def adapter_remax() -> List[Listing]:
     try:
         base_list_url = SITES["remax"]
+        # 1) Lista por si exponen algo estático
         cards = await scrape_generic_list(base_list_url, source="remax", read_timeout=7.0)
         if cards:
             return cards
 
+        # 2) Semillas
         detail_urls: List[str] = []
         for u in REMAX_SEEDS:
             if REMAX_ID_ABS_RE.search(u) and u not in detail_urls:
                 detail_urls.append(u)
 
+        # 3) Índices
         more = await remax_collect_ids_from_indexes(max_urls=max(0, 28 - len(detail_urls)))
         for u in more:
             if u not in detail_urls: detail_urls.append(u)
 
+        # 4) Sitemaps
         if len(detail_urls) < 12:
             sm = await remax_discover_detail_urls(max_urls=30, max_sitemaps=6)
             for u in sm:
@@ -750,7 +774,6 @@ def _csv_to_list(s: Optional[str]) -> Optional[List[str]]:
     if not s: return None
     return [x.strip() for x in s.split(",") if x.strip()]
 
-# *** AQUÍ ESTABA EL ERROR: corchete extra al final. ***
 async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listing]]]) -> List[Listing]:
     async with SEM:
         timeout = SITE_TIMEOUTS.get(key, ADAPTER_TIMEOUT)
