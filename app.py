@@ -3,7 +3,7 @@ from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Callable, Any, Coroutine, Tuple
-import asyncio, time, re, os, json, io, gzip
+import asyncio, time, re, os, json, gzip
 import httpx
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 # =========================
 # Config
 # =========================
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")     # cache positiva (5 min)
 NEG_TTL_SECONDS = int(os.getenv("SCRAPE_NEG_TTL_SECONDS", "120") or "120")  # cache para vacíos/errores (2 min)
 MAX_CARDS   = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
@@ -21,8 +21,7 @@ DEFAULT_SOURCES = os.getenv("DEFAULT_SOURCES", "demo")
 
 # timeouts específicos por sitio (segundos)
 SITE_TIMEOUTS: Dict[str, float] = {
-    "remax": 15.0,   # darle aire por sitemap + detalle
-    # puedes ajustar otros aquí si hace falta
+    "remax": 18.0,   # más aire: index + extracción de IDs + detalles
 }
 
 # =========================
@@ -97,7 +96,6 @@ def cache_set_pos(key: str, value):
     if value:
         CACHE.set(key, value, ttl_seconds=TTL_SECONDS)
     else:
-        # cachear vacío por poco tiempo para no repetir intentos fallidos
         CACHE.set(key, [], ttl_seconds=NEG_TTL_SECONDS)
 
 # =========================
@@ -106,6 +104,10 @@ def cache_set_pos(key: str, value):
 PRICE_RE = re.compile(r"(\d[\d.,\s]*)")
 BED_RE   = re.compile(r"(\d+)\s*(rec|recámaras|habitaciones|hab)", re.I)
 BATH_RE  = re.compile(r"(\d+(?:\.\d+)?)\s*(baños|banos|ba\u00f1os|bath)", re.I)
+
+# NUEVO: para extraer IDs de /propiedad/123456 aunque no haya <a> en el HTML estático
+REMAX_ID_RE = re.compile(r"https?://(?:www\.)?remax\.com\.mx/propiedad/(\d+)")
+REMAX_ID_REL_RE = re.compile(r"/propiedad/(\d+)")
 
 def _to_abs(base: str, href: str) -> str:
     if not href: return ""
@@ -163,7 +165,6 @@ def _split_city_colonia(loc_text: str) -> Tuple[Optional[str], Optional[str]]:
     return (city, colonia)
 
 def _httpx_timeout(read: float = 4.0):
-    # timeouts agresivos por defecto
     return httpx.Timeout(connect=4.0, read=read, write=4.0, pool=4.0)
 
 async def fetch_html(url: str, read_timeout: float = 4.0) -> Optional[str]:
@@ -353,9 +354,10 @@ async def scrape_generic_list(url: str, source: str, read_timeout: float = 4.0) 
     return out
 
 # =========================
-# RE/MAX: sitemap + detalle (con .gz)
+# RE/MAX: sitemap + INDEX-SCAN con regex de IDs + detalle
 # =========================
-async def remax_discover_detail_urls(max_urls: int = 24, max_sitemaps: int = 6) -> List[str]:
+async def remax_discover_detail_urls(max_urls: int = 30, max_sitemaps: int = 6) -> List[str]:
+    """Explora algunos sitemaps .xml(.gz) y junta URLs /propiedad/ID."""
     roots = ["https://www.remax.com.mx/sitemap.xml"]
     seen = set()
     seen_sitemaps = 0
@@ -376,7 +378,6 @@ async def remax_discover_detail_urls(max_urls: int = 24, max_sitemaps: int = 6) 
                     try:
                         content = gzip.decompress(content)
                     except Exception:
-                        # algunos servers ya lo entregan inflado
                         pass
                 try:
                     return content.decode("utf-8", "ignore")
@@ -418,12 +419,15 @@ async def remax_discover_detail_urls(max_urls: int = 24, max_sitemaps: int = 6) 
             if loc is None or not loc.text:
                 continue
             loc_text = loc.text.strip()
-            if "/propiedad/" in loc_text:
-                found.append(loc_text)
+            m1 = REMAX_ID_RE.search(loc_text)
+            m2 = REMAX_ID_REL_RE.search(loc_text)
+            if m1 or m2:
+                url = f"https://www.remax.com.mx/propiedad/{(m1 or m2).group(1)}"
+                found.append(url)
                 if len(found) >= max_urls:
                     break
 
-    # dedupe + limite
+    # dedupe
     uniq: List[str] = []
     seen_u = set()
     for u in found:
@@ -434,7 +438,44 @@ async def remax_discover_detail_urls(max_urls: int = 24, max_sitemaps: int = 6) 
             break
     return uniq
 
+async def remax_collect_ids_from_indexes(max_urls: int = 30) -> List[str]:
+    """
+    NUEVO: pide varias URLs de índice (estados/ciudades/propiedades) y extrae /propiedad/ID
+    con regex, aunque no existan <a> visibles en HTML estático.
+    """
+    index_urls = [
+        "https://www.remax.com.mx/propiedades",
+        "https://www.remax.com.mx/propiedades/ciudad%2Bde%2Bmexico_ciudad%2Bde%2Bmexico/venta",
+        "https://www.remax.com.mx/propiedades/guadalajara_jalisco/venta",
+        "https://www.remax.com.mx/propiedades/ensenada_baja%2Bcalifornia/residencial-casa/venta",
+        "https://www.remax.com.mx/propiedades/puerto%2Bpenasco_sonora/residencial-casa/venta",
+    ]
+    out: List[str] = []
+    seen = set()
+    for url in index_urls:
+        if len(out) >= max_urls:
+            break
+        html = await fetch_html(url, read_timeout=6.0)
+        if not html:
+            continue
+        # 1) Absolutas
+        for m in REMAX_ID_RE.finditer(html):
+            u = f"https://www.remax.com.mx/propiedad/{m.group(1)}"
+            if u not in seen:
+                out.append(u); seen.add(u)
+                if len(out) >= max_urls: break
+        if len(out) >= max_urls:
+            break
+        # 2) Relativas
+        for m in REMAX_ID_REL_RE.finditer(html):
+            u = f"https://www.remax.com.mx/propiedad/{m.group(1)}"
+            if u not in seen:
+                out.append(u); seen.add(u)
+                if len(out) >= max_urls: break
+    return out[:max_urls]
+
 def extract_from_property_detail(html: str, base_url: str, source: str, url: str, idx: int) -> Optional[Listing]:
+    # primero intentamos con JSON-LD
     items = parse_jsonld_listings(html, base_url=base_url, source=source)
     if items:
         items_sorted = sorted(items, key=lambda x: (x.price or 0), reverse=True)
@@ -442,6 +483,7 @@ def extract_from_property_detail(html: str, base_url: str, source: str, url: str
         best.url = url
         return best
 
+    # heurístico mínimo
     soup = BeautifulSoup(html, "html.parser")
     title = ""
     for sel in ["h1",".title",".titulo","[class*='title']","[class*='titulo']"]:
@@ -542,7 +584,6 @@ async def adapter_site(key: str) -> List[Listing]:
     url = SITES.get(key)
     if not url: return []
     try:
-        # lectura 4s por defecto
         return await scrape_generic_list(url, source=key, read_timeout=4.0)
     except Exception as e:
         print(f"[{key}] adapter error suprimido: {e}")
@@ -551,14 +592,26 @@ async def adapter_site(key: str) -> List[Listing]:
 async def adapter_remax() -> List[Listing]:
     try:
         base_list_url = SITES["remax"]
-        # 1) intento de lista (leer 6s porque a veces hidratan más)
+
+        # 1) Intento rápido de lista (por si exponen algo estático):
         cards = await scrape_generic_list(base_list_url, source="remax", read_timeout=6.0)
         if cards:
             return cards
-        # 2) fallback: sitemap .gz -> detalle
-        detail_urls = await remax_discover_detail_urls(max_urls=24, max_sitemaps=6)
+
+        # 2) NUEVO: Escaneo de URLs de índice con regex de IDs:
+        idx_urls = await remax_collect_ids_from_indexes(max_urls=24)
+
+        # 3) Fallback adicional: Sitemap (con .gz) en caso de que los índices no traigan nada:
+        if len(idx_urls) < 10:
+            sm_urls = await remax_discover_detail_urls(max_urls=24, max_sitemaps=6)
+        else:
+            sm_urls = []
+
+        detail_urls = list(dict.fromkeys(idx_urls + sm_urls))[:MAX_CARDS]
         if not detail_urls:
+            cache_set_pos("scrape::remax::fallback", [])
             return []
+
         listings: List[Listing] = []
         for i, u in enumerate(detail_urls):
             if len(listings) >= MAX_CARDS:
@@ -566,9 +619,12 @@ async def adapter_remax() -> List[Listing]:
             html = await fetch_html(u, read_timeout=8.0)
             if not html:
                 continue
-            item = extract_from_property_detail(html, base_url="https://www.remax.com.mx", source="remax", url=u, idx=i)
+            item = extract_from_property_detail(
+                html, base_url="https://www.remax.com.mx", source="remax", url=u, idx=i
+            )
             if item:
                 listings.append(item)
+
         cache_set_pos("scrape::remax::fallback", listings)
         return listings
     except Exception as e:
