@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 # =========================
 # Config
 # =========================
-APP_VERSION = "0.3.8"
+APP_VERSION = "0.3.8-hotfix"
 TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")
 NEG_TTL_SECONDS = int(os.getenv("SCRAPE_NEG_TTL_SECONDS", "120") or "120")
 MAX_CARDS   = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
@@ -101,7 +101,6 @@ def cache_set_pos(key: str, value):
 # Utilidades
 # =========================
 PRICE_RE = re.compile(r"(\d[\d.,\s]*)")
-# Añadí "cuartos" y "baño" sin acento
 BED_RE   = re.compile(r"(\d+)\s*(rec|recámaras|recamaras|habitaciones|hab|bed|cuartos?)", re.I)
 BATH_RE  = re.compile(r"(\d+(?:\.\d+)?)\s*(baños|banos|ba\u00f1os|bath|baño)", re.I)
 
@@ -115,7 +114,6 @@ UA_LIST = [
 ]
 
 def _headers():
-    import random
     return {
         "User-Agent": random.choice(UA_LIST),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -137,17 +135,14 @@ def _to_abs(base: str, href: str) -> str:
 
 def _parse_price_from_text(text: str) -> float:
     if not text: return 0.0
-    # 1) $ 4,200,000
     m = re.search(r"\$\s*([\d.,\s]+)", text)
     if m:
         try: return float(m.group(1).replace(",", "").replace(" ", ""))
         except: pass
-    # 2) Precio: 4200000 / 4,200,000 MXN / MN
     m = re.search(r"(?:precio|mxn|mn)\s*[:\-]?\s*([\d.,\s]+)", text, re.I)
     if m:
         try: return float(m.group(1).replace(",", "").replace(" ", ""))
         except: pass
-    # 3) fallback genérico
     m = PRICE_RE.search(text.replace(",", ""))
     if m:
         try: return float(m.group(1).replace(" ", ""))
@@ -304,7 +299,8 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
                 if cand: price_text = cand.get_text(strip=True); break
         if not price_text:
             t = card.get_text(" ", strip=True) if card else ""
-            price_text = (re.search(r"\$\s*[\d.,\s]+", t) or [None])[0] or ""
+            m = re.search(r"\$\s*[\d.,\s]+", t)
+            if m: price_text = m.group(0)
         price = _parse_price_from_text(price_text)
         loc_text = ""
         if card:
@@ -397,7 +393,6 @@ def _extract_embedded_state_ids(html: str) -> List[str]:
                 urls.append(f"https://www.remax.com.mx/propiedad/{m3.group(1)}")
         except Exception:
             pass
-    # Dedupe
     seen = set(); out: List[str] = []
     for u in urls:
         if u not in seen:
@@ -454,7 +449,6 @@ async def remax_discover_detail_urls(max_urls: int = 30, max_sitemaps: int = 6) 
                 url = f"https://www.remax.com.mx/propiedad/{(m1 or m2).group(1)}"
                 found.append(url)
                 if len(found) >= max_urls: break
-    # dedupe
     seen_u = set(); uniq: List[str] = []
     for u in found:
         if u not in seen_u:
@@ -511,14 +505,11 @@ def _clean_photos(urls: List[str], base_url: str) -> List[str]:
     return out[:12]
 
 def extract_from_property_detail(html: str, base_url: str, source: str, url: str, idx: int) -> Optional[Listing]:
-    # 1) JSON-LD primero (ideal: trae addressLocality/price/images)
     items = parse_jsonld_listings(html, base_url=base_url, source=source)
     if items:
         best = sorted(items, key=lambda x: (x.price or 0), reverse=True)[0]
         best.url = url
-        # Limpia fotos
         best.photos = _clean_photos(best.photos, base_url)
-        # Si falta ciudad, intenta meta/crumbs
         if not best.location_city:
             soup_tmp = BeautifulSoup(html, "html.parser")
             og_title = _meta(soup_tmp, "og:title") or ""
@@ -527,7 +518,6 @@ def extract_from_property_detail(html: str, base_url: str, source: str, url: str
                 best.location_city = city_guess
         return best
 
-    # 2) Metas + heurísticas robustas
     soup = BeautifulSoup(html, "html.parser")
     title = _meta(soup, "og:title") or ""
     if not title:
@@ -535,22 +525,18 @@ def extract_from_property_detail(html: str, base_url: str, source: str, url: str
             h = soup.select_one(sel)
             if h: title = h.get_text(strip=True); break
 
-    # Precio (metas comunes)
     price_text = _meta(soup, "product:price:amount") or _meta(soup, "og:price:amount") or ""
     if not price_text:
-        # Busca spans con clase precio/price
         for sel in [".price",".precio","[class*='price']","[class*='precio']"]:
             n = soup.select_one(sel)
             if n and n.get_text(strip=True):
                 price_text = n.get_text(strip=True); break
     if not price_text:
-        # Busca texto global con $ o "Precio"
         body_text = soup.get_text(" ", strip=True)
         price_val = _parse_price_from_text(body_text)
         if price_val > 0:
             price_text = str(price_val)
 
-    # Fotos
     photos: List[str] = []
     og_img = _meta(soup, "og:image")
     if og_img: photos.append(og_img)
@@ -558,7 +544,6 @@ def extract_from_property_detail(html: str, base_url: str, source: str, url: str
         if img.get("src"): photos.append(img["src"])
     photos = _clean_photos(photos, base_url)
 
-    # City/Colonia tentativa desde breadcrumbs o título
     city = None; colonia = None
     bc = soup.select("nav.breadcrumb a, .breadcrumb a, [class*='breadcrumb'] a")
     if bc:
@@ -569,11 +554,9 @@ def extract_from_property_detail(html: str, base_url: str, source: str, url: str
         c1, c2 = _split_city_colonia(title)
         city = city or c1; colonia = colonia or c2
 
-    # Recámaras/baños por texto
     low = soup.get_text(" ", strip=True).lower()
     beds  = _beds(low)
     baths = _baths(low)
-
     ltype = _infer_type((title or "") + " " + low)
 
     if not title and _parse_price_from_text(price_text) == 0 and not photos:
@@ -656,24 +639,19 @@ async def adapter_site(key: str) -> List[Listing]:
 async def adapter_remax() -> List[Listing]:
     try:
         base_list_url = SITES["remax"]
-
-        # 1) Lista (por si exponen estático)
         cards = await scrape_generic_list(base_list_url, source="remax", read_timeout=7.0)
         if cards:
             return cards
 
-        # 2) Semillas (al menos 1 resultado real)
         detail_urls: List[str] = []
         for u in REMAX_SEEDS:
             if REMAX_ID_ABS_RE.search(u) and u not in detail_urls:
                 detail_urls.append(u)
 
-        # 3) Índices
         more = await remax_collect_ids_from_indexes(max_urls=max(0, 28 - len(detail_urls)))
         for u in more:
             if u not in detail_urls: detail_urls.append(u)
 
-        # 4) Sitemaps
         if len(detail_urls) < 12:
             sm = await remax_discover_detail_urls(max_urls=30, max_sitemaps=6)
             for u in sm:
@@ -772,7 +750,8 @@ def _csv_to_list(s: Optional[str]) -> Optional[List[str]]:
     if not s: return None
     return [x.strip() for x in s.split(",") if x.strip()]
 
-async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listing]]]) -> List[Listing]]:
+# *** AQUÍ ESTABA EL ERROR: corchete extra al final. ***
+async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listing]]]) -> List[Listing]:
     async with SEM:
         timeout = SITE_TIMEOUTS.get(key, ADAPTER_TIMEOUT)
         try:
