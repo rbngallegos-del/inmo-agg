@@ -1,4 +1,4 @@
-# app.py (v0.5.0) — sin REMAX
+# app.py (v0.5.1) — sin REMAX, filtros de cards afinados
 from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,7 +7,7 @@ import asyncio, time, re, os, json, random
 import httpx
 from bs4 import BeautifulSoup
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 
 # --- Config ---
 TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")
@@ -17,7 +17,7 @@ ADAPTER_TIMEOUT = float(os.getenv("ADAPTER_TIMEOUT_SECONDS", "8"))
 CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "4") or "4")
 DEFAULT_SOURCES = os.getenv("DEFAULT_SOURCES", "demo")
 
-SITE_TIMEOUTS: Dict[str, float] = {}  # puedes tunear por sitio luego
+SITE_TIMEOUTS: Dict[str, float] = {}
 
 # --- Modelos ---
 class Listing(BaseModel):
@@ -60,7 +60,7 @@ def root_head():
 def health():
     return {"ok": True}
 
-# --- Cache simple en memoria ---
+# --- Cache simple ---
 class SimpleCache:
     def __init__(self):
         self.data: Dict[str, Any] = {}
@@ -80,20 +80,24 @@ SEM = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 def cache_get_pos_or_neg(key: str):
     return CACHE.get(key)
-
 def cache_set_pos(key: str, value):
     CACHE.set(key, value if value else [], ttl_seconds=TTL_SECONDS if value else NEG_TTL_SECONDS)
 
-# --- Utilidades scraping genérico ---
+# --- Utilidades ---
 UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
 ]
-
 PRICE_RE = re.compile(r"(\d[\d.,\s]*)")
 BED_RE   = re.compile(r"(\d+)\s*(rec|recámaras|recamaras|habitaciones|hab|bed|cuartos?)", re.I)
 BATH_RE  = re.compile(r"(\d+(?:\.\d+)?)\s*(baños|banos|ba\u00f1os|bath|baño)", re.I)
+PHONE_RE = re.compile(r"^\+?\d[\d\s\-\(\)]{7,}$")
+
+PROP_KEYWORDS = (
+    "propiedad","propiedades","inmueble","venta","renta","alquiler","casa","departamento",
+    "depto","terreno","local","oficina","bodega","detalle","listing","anuncio","ficha"
+)
 
 def _headers():
     return {
@@ -116,23 +120,20 @@ def _to_abs(base: str, href: str) -> str:
     return b + href
 
 def _normalize(s: str) -> str:
-    return (s or "").replace("\xa0", " ").replace("\u202f", " ").replace("\u2009", " ").replace("\u2007", " ")
+    return (s or "").replace("\xa0"," ").replace("\u202f"," ").replace("\u2009"," ").replace("\u2007"," ")
 
 def _parse_price_from_text(text: str) -> float:
     if not text: return 0.0
     t = _normalize(text).lower()
-    # $ 4,200,000 MXN / MN
     m = re.search(r"\$\s*([\d.,\s]+)", t)
     if m:
         try: return float(m.group(1).replace(",", "").replace(" ", ""))
         except: pass
-    # 4.2 mdp / 4,2 millones
     m2 = re.search(r"([\d]+(?:[.,]\d+)?)\s*(mdp|m\.?d\.?p\.?|millones?)", t, re.I)
     if m2:
         num = m2.group(1).replace(",", ".")
         try: return float(num) * 1_000_000
         except: pass
-    # precio: 4200000
     m3 = PRICE_RE.search(t.replace(",", ""))
     if m3:
         try: return float(m3.group(1).replace(" ", ""))
@@ -146,16 +147,10 @@ def _pick_best_price(cands: List[float]) -> float:
 def _infer_type(text: str) -> str:
     t = (text or "").lower()
     for k, v in [
-        ("departamento", "departamento"),
-        ("depto", "departamento"),
-        ("casa", "casa"),
-        ("oficina", "oficina"),
-        ("bodega", "bodega"),
-        ("local", "local"),
-        ("terreno", "terreno"),
-        ("edificio", "edificio"),
-        ("loft", "departamento"),
-        ("ph", "departamento"),
+        ("departamento","departamento"),("depto","departamento"),("casa","casa"),
+        ("oficina","oficina"),("bodega","bodega"),("local","local"),
+        ("terreno","terreno"),("edificio","edificio"),("loft","departamento"),
+        ("ph","departamento"),
     ]:
         if k in t: return v
     return "otro"
@@ -182,12 +177,11 @@ def _split_city_colonia(loc_text: str) -> Tuple[Optional[str], Optional[str]]:
 def _httpx_timeout(read: float = 4.0):
     return httpx.Timeout(connect=4.0, read=read, write=4.0, pool=4.0)
 
-async def fetch_html(url: str, read_timeout: float = 4.0, tries: int = 2) -> Optional[str]:
+async def fetch_html(url: str, read_timeout: float = 5.0, tries: int = 2) -> Optional[str]:
     delay = 0.6
     for attempt in range(tries):
         try:
-            async with httpx.AsyncClient(timeout=_httpx_timeout(read=read_timeout),
-                                         headers=_headers()) as client:
+            async with httpx.AsyncClient(timeout=_httpx_timeout(read=read_timeout), headers=_headers()) as client:
                 r = await client.get(url, follow_redirects=True)
                 if r.status_code != 200:
                     print(f"[scrape] HTTP {r.status_code} {url}")
@@ -200,28 +194,18 @@ async def fetch_html(url: str, read_timeout: float = 4.0, tries: int = 2) -> Opt
     return None
 
 def _meta(soup: BeautifulSoup, key: str) -> Optional[str]:
-    tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key}) \
-          or soup.find("meta", attrs={"itemprop": key})
+    tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key}) or soup.find("meta", attrs={"itemprop": key})
     return (tag.get("content") or "").strip() if tag and tag.get("content") else None
 
 def _clean_photos_generic(urls: List[str], base_url: str) -> List[str]:
-    """
-    Mantén JPG/JPEG y filtra obvios íconos/logos/miniaturas por nombre.
-    (No dependemos de un CDN específico.)
-    """
     out: List[str] = []
     ban_words = ["icon", "logo", "sprite", "placeholder", "thumb", "avatar", "svg"]
     for u in urls:
         if not u: continue
-        absu = _to_abs(base_url, u)
-        low = absu.lower()
-        if not (low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".png")):
-            continue
-        if any(b in low for b in ban_words):
-            continue
-        if absu not in out:
-            out.append(absu)
-    # Priorizamos JPG/JPEG sobre PNG
+        absu = _to_abs(base_url, u); low = absu.lower()
+        if not (low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".png")): continue
+        if any(b in low for b in ban_words): continue
+        if absu not in out: out.append(absu)
     out_sorted = sorted(out, key=lambda x: (x.lower().endswith(".png"), x))
     return out_sorted[:12]
 
@@ -230,10 +214,8 @@ def parse_jsonld_listings(html: str, base_url: str, source: str) -> List[Listing
     soup = BeautifulSoup(html, "html.parser")
     out: List[Listing] = []
     for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "null")
-        except Exception:
-            continue
+        try: data = json.loads(script.string or "null")
+        except Exception: continue
         items = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
         for it in items:
             try:
@@ -263,57 +245,63 @@ def parse_jsonld_listings(html: str, base_url: str, source: str) -> List[Listing
                     title=name or "Propiedad",
                     price=price,
                     currency="MXN",
-                    bedrooms=beds,
-                    bathrooms=baths,
-                    type=ltype,
-                    furnished=None,
-                    location_city=locality,
-                    location_colonia=None,
-                    url=url or base_url,
-                    source=source,
+                    bedrooms=beds, bathrooms=baths, type=ltype, furnished=None,
+                    location_city=locality, location_colonia=None,
+                    url=url or base_url, source=source,
                     photos=_clean_photos_generic(photos, base_url),
                 ))
-            except Exception:
-                continue
+            except Exception: continue
     return out
 
 def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Listing] = []
-    anchors = soup.select('a[href]')
     seen = set()
+    anchors = soup.select('a[href]')
 
     def is_bad_title(t: str) -> bool:
         if not t: return True
-        t = t.strip().lower()
-        bad = {"busca una propiedad", "buscar", "ver más", "ver mas", "contacto", "más info", "mas info", "ver detalles"}
-        return t in bad or len(t) < 3
+        t2 = t.strip()
+        if not t2: return True
+        low = t2.lower()
+        if low in {"busca una propiedad","buscar","ver más","ver mas","contacto","más info","mas info","ver detalles"}: return True
+        if len(low) < 3: return True
+        if PHONE_RE.match(t2): return True
+        return False
 
-    for a in anchors[: MAX_CARDS * 5]:
+    def looks_like_property(href: str) -> bool:
+        low = href.lower()
+        if low.startswith(("tel:","mailto:","javascript:","#")): return False
+        # redes/menú comunes
+        if any(p in low for p in ("/facebook","/instagram","/whatsapp","/twitter","/x.com","/linkedin")): return False
+        return any(k in low for k in PROP_KEYWORDS)
+
+    for a in anchors[: MAX_CARDS * 6]:
         href = a.get("href") or ""
+        if not href: continue
         abs_url = _to_abs(base_url, href)
-        if not abs_url or abs_url in seen:
-            continue
-        # Heurística: anclas que parecen cards (tienen img o un bloque con precio/ubicación)
+        if not abs_url: continue
+        if abs_url in seen: continue
+        if href.lower().startswith(("tel:","mailto:","javascript:","#")): continue
+
+        # Ubica contenedor "card"
         card = a
         for _ in range(6):
-            if not card or getattr(card, "name", "").lower() in ("body","html"):
-                break
+            if not card or getattr(card, "name","").lower() in ("body","html"): break
             if card.select_one("img") or card.select_one(".price, .precio, [class*='price'], [class*='precio']") \
                or card.select_one(".location, .ubicacion, [class*='ubicacion'], [class*='location']"):
                 break
             card = card.parent
 
-        # Evita menús/footers vacíos
+        # Título
         title = (a.get_text(strip=True) or "").strip()
         if is_bad_title(title):
             h = None
             for sel in ["h1","h2","h3",".card-title",".titulo",".title","[class*='titulo']","[class*='title']"]:
                 h = card.select_one(sel) if card else None
                 if h:
-                    title = h.get_text(strip=True)
-                    break
-        if is_bad_title(title):
+                    title = h.get_text(strip=True); break
+        if is_bad_title(title):  # aún basura (teléfono, vacío, etc.)
             continue
 
         # Precio
@@ -322,13 +310,16 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
             for sel in [".price",".precio","[class*='price']","[class*='precio']"]:
                 cand = card.select_one(sel)
                 if cand:
-                    price_text = cand.get_text(strip=True)
-                    break
+                    price_text = cand.get_text(" ", strip=True); break
         if not price_text and card:
             t = card.get_text(" ", strip=True)
             m = re.search(r"\$\s*[\d.,\s]+", t)
             if m: price_text = m.group(0)
         price = _parse_price_from_text(price_text)
+
+        # Heurística final: o hay precio (>0) o el href parece detalle de propiedad
+        if price <= 0 and not looks_like_property(href):
+            continue
 
         # Ubicación
         loc_text = ""
@@ -336,52 +327,41 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
             for sel in [".location",".ubicacion","[class*='ubicacion']","[class*='location']"]:
                 cand = card.select_one(sel)
                 if cand:
-                    loc_text = cand.get_text(strip=True)
-                    break
+                    loc_text = cand.get_text(" ", strip=True); break
         city, colonia = _split_city_colonia(loc_text)
 
         # Foto
         photo_url = None
         if card:
-            img = card.select_one("img")
+            img = card.select_one("img[src]")
             if img and img.get("src"):
                 photo_url = _to_abs(base_url, img["src"])
+        photos = _clean_photos_generic([photo_url] if photo_url else [], base_url)
 
         card_text = ((title or "") + " " + (loc_text or "")).lower()
         ltype = _infer_type(card_text)
         beds  = _beds(card_text)
         baths = _baths(card_text)
 
-        photos = _clean_photos_generic([photo_url] if photo_url else [], base_url)
-
         out.append(Listing(
             id=f"{source}-card-{len(out)}",
             title=title or "Propiedad",
-            price=price,
-            currency="MXN",
-            bedrooms=beds,
-            bathrooms=baths,
-            type=ltype,
-            furnished=None,
-            location_city=city,
-            location_colonia=colonia,
-            url=abs_url,
-            source=source,
-            photos=photos,
+            price=price, currency="MXN",
+            bedrooms=beds, bathrooms=baths, type=ltype, furnished=None,
+            location_city=city, location_colonia=colonia,
+            url=abs_url, source=source, photos=photos,
         ))
         seen.add(abs_url)
         if len(out) >= MAX_CARDS: break
     return out
 
-async def scrape_generic_list(url: str, source: str, read_timeout: float = 5.0) -> List[Listing]:
+async def scrape_generic_list(url: str, source: str, read_timeout: float = 6.0) -> List[Listing]:
     cache_key = f"scrape::{source}::{url}"
     cached = cache_get_pos_or_neg(cache_key)
-    if cached is not None:
-        return cached
+    if cached is not None: return cached
     html = await fetch_html(url, read_timeout=read_timeout, tries=2)
     if not html:
-        cache_set_pos(cache_key, [])
-        return []
+        cache_set_pos(cache_key, []); return []
     items = parse_jsonld_listings(html, base_url=_to_abs(url,""), source=source)
     if len(items) < 5:
         items += parse_cards_heuristic(html, base_url=_to_abs(url,""), source=source)
@@ -394,25 +374,13 @@ async def scrape_generic_list(url: str, source: str, read_timeout: float = 5.0) 
     cache_set_pos(cache_key, out)
     return out
 
-# --- Adapters (sin remax) ---
+# --- Adapters (catálogo) ---
 async def adapter_demo() -> List[Listing]:
     await asyncio.sleep(0.01)
     return [
-        Listing(
-            id="demo1", title="Depto 2 rec Col. Primavera", price=9000,
-            bedrooms=2, bathrooms=1, type="departamento", furnished=False,
-            location_city="Tampico", location_colonia="Primavera",
-            url="https://ejemplo.local/depto-primavera", source="demo", photos=[]),
-        Listing(
-            id="demo2", title="Casa 3 rec Col. Del Bosque", price=18000,
-            bedrooms=3, bathrooms=2, type="casa",
-            location_city="Tampico", location_colonia="Del Bosque",
-            url="https://ejemplo.local/casa-bosque", source="demo", photos=[]),
-        Listing(
-            id="demo3", title="Local comercial Centro", price=12000,
-            bedrooms=None, bathrooms=1, type="local", furnished=False,
-            location_city="Ciudad Madero", location_colonia="Centro",
-            url="https://ejemplo.local/local-centro", source="demo", photos=[]),
+        Listing(id="demo1", title="Depto 2 rec Col. Primavera", price=9000, bedrooms=2, bathrooms=1, type="departamento", furnished=False, location_city="Tampico", location_colonia="Primavera", url="https://ejemplo.local/depto-primavera", source="demo", photos=[]),
+        Listing(id="demo2", title="Casa 3 rec Col. Del Bosque", price=18000, bedrooms=3, bathrooms=2, type="casa", location_city="Tampico", location_colonia="Del Bosque", url="https://ejemplo.local/casa-bosque", source="demo", photos=[]),
+        Listing(id="demo3", title="Local comercial Centro", price=12000, bedrooms=None, bathrooms=1, type="local", furnished=False, location_city="Ciudad Madero", location_colonia="Centro", url="https://ejemplo.local/local-centro", source="demo", photos=[]),
     ]
 
 SITES: Dict[str, str] = {
@@ -444,12 +412,12 @@ async def adapter_site(key: str) -> List[Listing]:
     url = SITES.get(key)
     if not url: return []
     try:
-        return await scrape_generic_list(url, source=key, read_timeout=5.0)
+        return await scrape_generic_list(url, source=key, read_timeout=6.0)
     except Exception as e:
         print(f"[{key}] adapter error suprimido: {e}")
         return []
 
-# Registro de adapters
+# Registro
 ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
     "demo": adapter_demo,
     "aysainmobiliaria": adapter_site,
@@ -497,18 +465,15 @@ async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listi
     async with SEM:
         timeout = SITE_TIMEOUTS.get(key, ADAPTER_TIMEOUT)
         try:
-            # adapter_site necesita saber el key -> usamos un wrapper simple
             if fn is adapter_site:
                 async def run(): return await adapter_site(key)
                 return await asyncio.wait_for(run(), timeout=timeout)
             else:
                 return await asyncio.wait_for(fn(), timeout=timeout)
         except asyncio.TimeoutError:
-            print(f"[adapter:{key}] timeout > {timeout}s")
-            return []
+            print(f"[adapter:{key}] timeout > {timeout}s"); return []
         except Exception as e:
-            print(f"[adapter:{key}] error suprimido: {e}")
-            return []
+            print(f"[adapter:{key}] error suprimido: {e}"); return []
 
 async def _collect_sources(sources: Optional[List[str]]) -> List[Listing]:
     keys = sources if sources else [s.strip() for s in DEFAULT_SOURCES.split(",") if s.strip()]
@@ -520,31 +485,24 @@ async def _collect_sources(sources: Optional[List[str]]) -> List[Listing]:
     return out
 
 def _passes_filters(l: Listing, q: SearchRequest) -> bool:
-    if q.cities and (l.location_city or "").lower() not in {c.lower() for c in q.cities}:
-        return False
+    if q.cities and (l.location_city or "").lower() not in {c.lower() for c in q.cities}: return False
     if q.min_price is not None and l.price < q.min_price: return False
     if q.max_price is not None and l.price > q.max_price: return False
     if q.min_bedrooms is not None:
         tipo = (l.type or "").lower()
         if tipo in {"casa","departamento","depto"}:
-            if l.bedrooms is None or l.bedrooms < q.min_bedrooms:
-                return False
+            if l.bedrooms is None or l.bedrooms < q.min_bedrooms: return False
     if q.furnished is not None:
-        if l.furnished is None or l.furnished is not q.furnished:
-            return False
-    if q.property_types and (l.type or "").lower() not in {t.lower() for t in q.property_types}:
-        return False
-    if q.q and q.q.lower() not in (l.title or "").lower():
-        return False
+        if l.furnished is None or l.furnished is not q.furnished: return False
+    if q.property_types and (l.type or "").lower() not in {t.lower() for t in q.property_types}: return False
+    if q.q and q.q.lower() not in (l.title or "").lower(): return False
     return True
 
 async def _search_core(q: SearchRequest) -> SearchResponse:
     data = await _collect_sources(q.sources)
     filtered = [l for l in data if _passes_filters(l, q)]
-    start = max(q.offset, 0)
-    end = start + (q.limit if q.limit and q.limit > 0 else 25)
-    page = filtered[start:end]
-    next_off = end if end < len(filtered) else None
+    start = max(q.offset, 0); end = start + (q.limit if q.limit and q.limit > 0 else 25)
+    page = filtered[start:end]; next_off = end if end < len(filtered) else None
     return SearchResponse(results=page, total=len(filtered), next_offset=next_off)
 
 # --- Endpoints ---
@@ -562,27 +520,18 @@ async def search_get(
     offset: int = Query(0, ge=0),
 ):
     req = SearchRequest(
-        cities=_csv_to_list(cities),
-        min_price=min_price,
-        max_price=max_price,
-        min_bedrooms=min_bedrooms,
-        furnished=furnished,
-        property_types=_csv_to_list(property_types),
-        q=q,
-        sources=_csv_to_list(sources),
-        limit=limit,
-        offset=offset,
+        cities=_csv_to_list(cities), min_price=min_price, max_price=max_price,
+        min_bedrooms=min_bedrooms, furnished=furnished,
+        property_types=_csv_to_list(property_types), q=q,
+        sources=_csv_to_list(sources), limit=limit, offset=offset,
     )
     return await _search_core(req)
 
 @app.get("/search-listings", response_model=SearchResponse)
-async def search_listings_alias(**kwargs):
-    return await search_get(**kwargs)
+async def search_listings_alias(**kwargs): return await search_get(**kwargs)
 
 @app.get("/searchListings", response_model=SearchResponse)
-async def searchListings_alias(**kwargs):
-    return await search_get(**kwargs)
+async def searchListings_alias(**kwargs): return await search_get(**kwargs)
 
 @app.post("/search", response_model=SearchResponse)
-async def search_post(req: SearchRequest):
-    return await _search_core(req)
+async def search_post(req: SearchRequest): return await _search_core(req)
