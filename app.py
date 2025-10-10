@@ -1,26 +1,25 @@
-# app.py (v0.4.2)
+# app.py (v0.5.0) — sin REMAX
 from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Callable, Any, Coroutine, Tuple
-import asyncio, time, re, os, json, gzip, random
+import asyncio, time, re, os, json, random
 import httpx
 from bs4 import BeautifulSoup
-import xml.etree.ElementTree as ET
 
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.5.0"
+
+# --- Config ---
 TTL_SECONDS = int(os.getenv("SCRAPE_TTL_SECONDS", "300") or "300")
 NEG_TTL_SECONDS = int(os.getenv("SCRAPE_NEG_TTL_SECONDS", "120") or "120")
 MAX_CARDS   = int(os.getenv("SCRAPE_MAX_CARDS", "60") or "60")
 ADAPTER_TIMEOUT = float(os.getenv("ADAPTER_TIMEOUT_SECONDS", "8"))
 CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "4") or "4")
 DEFAULT_SOURCES = os.getenv("DEFAULT_SOURCES", "demo")
-REMAX_SEEDS = [u.strip() for u in (os.getenv("REMAX_SEEDS", "https://remax.com.mx/propiedad/642420") or "").split(",") if u.strip()]
-SITE_TIMEOUTS: Dict[str, float] = {"remax": 20.0}
 
-# =========================
-# Modelos
-# =========================
+SITE_TIMEOUTS: Dict[str, float] = {}  # puedes tunear por sitio luego
+
+# --- Modelos ---
 class Listing(BaseModel):
     id: str
     title: str
@@ -41,9 +40,7 @@ class SearchResponse(BaseModel):
     total: int
     next_offset: Optional[int] = None
 
-# =========================
-# App
-# =========================
+# --- App ---
 app = FastAPI(title="Inmo Aggregator", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
@@ -63,9 +60,7 @@ def root_head():
 def health():
     return {"ok": True}
 
-# =========================
-# Cache simple
-# =========================
+# --- Cache simple en memoria ---
 class SimpleCache:
     def __init__(self):
         self.data: Dict[str, Any] = {}
@@ -89,20 +84,16 @@ def cache_get_pos_or_neg(key: str):
 def cache_set_pos(key: str, value):
     CACHE.set(key, value if value else [], ttl_seconds=TTL_SECONDS if value else NEG_TTL_SECONDS)
 
-# =========================
-# Utilidades
-# =========================
-REMAX_ID_ABS_RE = re.compile(r"https?://(?:www\.)?remax\.com\.mx/propiedad/(\d+)")
-REMAX_ID_REL_RE = re.compile(r"/propiedad/(\d+)")
-PRICE_RE = re.compile(r"(\d[\d.,\s]*)")
-BED_RE   = re.compile(r"(\d+)\s*(rec|recámaras|recamaras|habitaciones|hab|bed|cuartos?)", re.I)
-BATH_RE  = re.compile(r"(\d+(?:\.\d+)?)\s*(baños|banos|ba\u00f1os|bath|baño)", re.I)
-
+# --- Utilidades scraping genérico ---
 UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
 ]
+
+PRICE_RE = re.compile(r"(\d[\d.,\s]*)")
+BED_RE   = re.compile(r"(\d+)\s*(rec|recámaras|recamaras|habitaciones|hab|bed|cuartos?)", re.I)
+BATH_RE  = re.compile(r"(\d+(?:\.\d+)?)\s*(baños|banos|ba\u00f1os|bath|baño)", re.I)
 
 def _headers():
     return {
@@ -125,74 +116,28 @@ def _to_abs(base: str, href: str) -> str:
     return b + href
 
 def _normalize(s: str) -> str:
-    # NBSP, thin spaces, y similares a espacio normal
     return (s or "").replace("\xa0", " ").replace("\u202f", " ").replace("\u2009", " ").replace("\u2007", " ")
 
-def _parse_price_from_text_basic(text: str) -> float:
+def _parse_price_from_text(text: str) -> float:
     if not text: return 0.0
-    t = _normalize(text)
+    t = _normalize(text).lower()
+    # $ 4,200,000 MXN / MN
     m = re.search(r"\$\s*([\d.,\s]+)", t)
     if m:
         try: return float(m.group(1).replace(",", "").replace(" ", ""))
         except: pass
-    m = re.search(r"(?:precio|mxn|mn|m\.n\.)\s*[:\-]?\s*([\d.,\s]+)", t, re.I)
-    if m:
-        try: return float(m.group(1).replace(",", "").replace(" ", ""))
-        except: pass
-    m = PRICE_RE.search(t.replace(",", ""))
-    if m:
-        try: return float(m.group(1).replace(" ", ""))
-        except: pass
-    return 0.0
-
-def _parse_price_with_multipliers(text: str) -> float:
-    if not text: return 0.0
-    t = _normalize(text).lower()
-    # $4.2 mdp / 4,2 millones
-    m = re.search(r"\$?\s*([\d]+(?:[.,]\d+)?)\s*(mdp|m\.?d\.?p\.?|millones?|millon)", t, re.I)
-    if m:
-        num = m.group(1).replace(",", ".")
+    # 4.2 mdp / 4,2 millones
+    m2 = re.search(r"([\d]+(?:[.,]\d+)?)\s*(mdp|m\.?d\.?p\.?|millones?)", t, re.I)
+    if m2:
+        num = m2.group(1).replace(",", ".")
         try: return float(num) * 1_000_000
         except: pass
-    # $4,200,000 mxn/mn
-    m2 = re.search(r"\$\s*([\d.,\s]+)\s*(mxn|mn|m\.n\.)", t, re.I)
-    if m2:
-        try: return float(_normalize(m2.group(1)).replace(",", "").replace(" ", ""))
+    # precio: 4200000
+    m3 = PRICE_RE.search(t.replace(",", ""))
+    if m3:
+        try: return float(m3.group(1).replace(" ", ""))
         except: pass
-    # genérico
-    return _parse_price_from_text_basic(text)
-
-def _price_candidates_from_meta(soup: BeautifulSoup) -> List[float]:
-    keys = ["product:price:amount","og:price:amount","twitter:data1","price","product:price","product:price:currency"]
-    out: List[float] = []
-    for k in keys:
-        tag = soup.find("meta", attrs={"property": k}) or soup.find("meta", attrs={"name": k}) or soup.find("meta", attrs={"itemprop": k})
-        if tag and tag.get("content"):
-            out.append(_parse_price_with_multipliers(tag.get("content")))
-    el = soup.find(attrs={"itemprop": "price"})
-    if el:
-        if el.get("content"): out.append(_parse_price_with_multipliers(el.get("content")))
-        if el.get_text(strip=True): out.append(_parse_price_with_multipliers(el.get_text(strip=True)))
-    for sel in [".price",".precio","[class*='price']","[class*='precio']"]:
-        n = soup.select_one(sel)
-        if n: out.append(_parse_price_with_multipliers(n.get_text(" ", strip=True)))
-    return [x for x in out if x]
-
-def _price_candidates_from_html(html: str) -> List[float]:
-    """Captura VENTA $5,500,000 MXN, $5,500,000 MXN, MN/M.N., y MDP en el HTML crudo."""
-    out: List[float] = []
-    H = _normalize(html)
-    # VENTA $5,500,000 MXN  /  $5,500,000 MXN  /  $5,500,000 MN/M.N.
-    for m in re.finditer(r"(VENTA|Renta|Precio)?\s*\$?\s*([\d][\d.,\s]+)\s*(MXN|MN|M\.N\.)", H, re.I):
-        try:
-            out.append(float(m.group(2).replace(",", "").replace(" ", "")))
-        except: pass
-    # $ 4.2 MDP / 4.2 MDP
-    for m in re.finditer(r"\$?\s*([\d]+(?:[.,]\d+)?)\s*(MDP|M\.?D\.?P\.?|MILLONES?)", H, re.I):
-        num = m.group(1).replace(",", ".")
-        try: out.append(float(num) * 1_000_000)
-        except: pass
-    return [x for x in out if x]
+    return 0.0
 
 def _pick_best_price(cands: List[float]) -> float:
     valid = [x for x in cands if x and 10_000 <= x <= 200_000_000]
@@ -201,9 +146,16 @@ def _pick_best_price(cands: List[float]) -> float:
 def _infer_type(text: str) -> str:
     t = (text or "").lower()
     for k, v in [
-        ("departamento","departamento"),("depto","departamento"),("casa","casa"),
-        ("oficina","oficina"),("bodega","bodega"),("local","local"),
-        ("terreno","terreno"),("edificio","edificio"),("loft","departamento"),("ph","departamento")
+        ("departamento", "departamento"),
+        ("depto", "departamento"),
+        ("casa", "casa"),
+        ("oficina", "oficina"),
+        ("bodega", "bodega"),
+        ("local", "local"),
+        ("terreno", "terreno"),
+        ("edificio", "edificio"),
+        ("loft", "departamento"),
+        ("ph", "departamento"),
     ]:
         if k in t: return v
     return "otro"
@@ -247,7 +199,33 @@ async def fetch_html(url: str, read_timeout: float = 4.0, tries: int = 2) -> Opt
                 await asyncio.sleep(delay); delay *= 1.8
     return None
 
-# ============ Parsers genéricos ============
+def _meta(soup: BeautifulSoup, key: str) -> Optional[str]:
+    tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key}) \
+          or soup.find("meta", attrs={"itemprop": key})
+    return (tag.get("content") or "").strip() if tag and tag.get("content") else None
+
+def _clean_photos_generic(urls: List[str], base_url: str) -> List[str]:
+    """
+    Mantén JPG/JPEG y filtra obvios íconos/logos/miniaturas por nombre.
+    (No dependemos de un CDN específico.)
+    """
+    out: List[str] = []
+    ban_words = ["icon", "logo", "sprite", "placeholder", "thumb", "avatar", "svg"]
+    for u in urls:
+        if not u: continue
+        absu = _to_abs(base_url, u)
+        low = absu.lower()
+        if not (low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".png")):
+            continue
+        if any(b in low for b in ban_words):
+            continue
+        if absu not in out:
+            out.append(absu)
+    # Priorizamos JPG/JPEG sobre PNG
+    out_sorted = sorted(out, key=lambda x: (x.lower().endswith(".png"), x))
+    return out_sorted[:12]
+
+# --- Parsers genéricos ---
 def parse_jsonld_listings(html: str, base_url: str, source: str) -> List[Listing]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Listing] = []
@@ -264,11 +242,11 @@ def parse_jsonld_listings(html: str, base_url: str, source: str) -> List[Listing
                 price = 0.0
                 offers = it.get("offers")
                 if isinstance(offers, dict):
-                    price = _parse_price_with_multipliers(str(offers.get("price") or offers.get("priceSpecification", {}).get("price") or ""))
+                    price = _parse_price_from_text(str(offers.get("price") or offers.get("priceSpecification", {}).get("price") or ""))
                 elif isinstance(offers, list) and offers:
-                    price = _parse_price_with_multipliers(str(offers[0].get("price") or ""))
+                    price = _parse_price_from_text(str(offers[0].get("price") or ""))
                 else:
-                    price = _parse_price_with_multipliers(name)
+                    price = _parse_price_from_text(name)
                 addr = it.get("address") or {}
                 locality = addr.get("addressLocality") if isinstance(addr, dict) else (addr if isinstance(addr, str) else None)
                 img = it.get("image")
@@ -279,8 +257,7 @@ def parse_jsonld_listings(html: str, base_url: str, source: str) -> List[Listing
                     photos = [_to_abs(base_url, img)]
                 fulltext = json.dumps(it, ensure_ascii=False).lower()
                 ltype = _infer_type(name + " " + fulltext)
-                beds  = _beds(fulltext)
-                baths = _baths(fulltext)
+                beds  = _beds(fulltext); baths = _baths(fulltext)
                 out.append(Listing(
                     id=f"{source}-jsonld-{len(out)}",
                     title=name or "Propiedad",
@@ -294,7 +271,7 @@ def parse_jsonld_listings(html: str, base_url: str, source: str) -> List[Listing
                     location_colonia=None,
                     url=url or base_url,
                     source=source,
-                    photos=photos,
+                    photos=_clean_photos_generic(photos, base_url),
                 ))
             except Exception:
                 continue
@@ -303,19 +280,21 @@ def parse_jsonld_listings(html: str, base_url: str, source: str) -> List[Listing
 def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Listing] = []
-    anchors = soup.select('a[href*="/propiedad/"]')
+    anchors = soup.select('a[href]')
     seen = set()
+
     def is_bad_title(t: str) -> bool:
         if not t: return True
         t = t.strip().lower()
         bad = {"busca una propiedad", "buscar", "ver más", "ver mas", "contacto", "más info", "mas info", "ver detalles"}
         return t in bad or len(t) < 3
-    for a in anchors[: MAX_CARDS * 3]:
+
+    for a in anchors[: MAX_CARDS * 5]:
         href = a.get("href") or ""
         abs_url = _to_abs(base_url, href)
         if not abs_url or abs_url in seen:
             continue
-        seen.add(abs_url)
+        # Heurística: anclas que parecen cards (tienen img o un bloque con precio/ubicación)
         card = a
         for _ in range(6):
             if not card or getattr(card, "name", "").lower() in ("body","html"):
@@ -324,38 +303,57 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
                or card.select_one(".location, .ubicacion, [class*='ubicacion'], [class*='location']"):
                 break
             card = card.parent
+
+        # Evita menús/footers vacíos
         title = (a.get_text(strip=True) or "").strip()
         if is_bad_title(title):
             h = None
             for sel in ["h1","h2","h3",".card-title",".titulo",".title","[class*='titulo']","[class*='title']"]:
                 h = card.select_one(sel) if card else None
-                if h: title = h.get_text(strip=True); break
-        if is_bad_title(title): continue
+                if h:
+                    title = h.get_text(strip=True)
+                    break
+        if is_bad_title(title):
+            continue
+
+        # Precio
         price_text = ""
         if card:
             for sel in [".price",".precio","[class*='price']","[class*='precio']"]:
                 cand = card.select_one(sel)
-                if cand: price_text = cand.get_text(strip=True); break
-        if not price_text:
-            t = card.get_text(" ", strip=True) if card else ""
+                if cand:
+                    price_text = cand.get_text(strip=True)
+                    break
+        if not price_text and card:
+            t = card.get_text(" ", strip=True)
             m = re.search(r"\$\s*[\d.,\s]+", t)
             if m: price_text = m.group(0)
-        price = _parse_price_with_multipliers(price_text)
+        price = _parse_price_from_text(price_text)
+
+        # Ubicación
         loc_text = ""
         if card:
             for sel in [".location",".ubicacion","[class*='ubicacion']","[class*='location']"]:
                 cand = card.select_one(sel)
-                if cand: loc_text = cand.get_text(strip=True); break
+                if cand:
+                    loc_text = cand.get_text(strip=True)
+                    break
         city, colonia = _split_city_colonia(loc_text)
+
+        # Foto
         photo_url = None
         if card:
             img = card.select_one("img")
             if img and img.get("src"):
                 photo_url = _to_abs(base_url, img["src"])
+
         card_text = ((title or "") + " " + (loc_text or "")).lower()
         ltype = _infer_type(card_text)
         beds  = _beds(card_text)
         baths = _baths(card_text)
+
+        photos = _clean_photos_generic([photo_url] if photo_url else [], base_url)
+
         out.append(Listing(
             id=f"{source}-card-{len(out)}",
             title=title or "Propiedad",
@@ -369,12 +367,13 @@ def parse_cards_heuristic(html: str, base_url: str, source: str) -> List[Listing
             location_colonia=colonia,
             url=abs_url,
             source=source,
-            photos=[photo_url] if photo_url else [],
+            photos=photos,
         ))
+        seen.add(abs_url)
         if len(out) >= MAX_CARDS: break
     return out
 
-async def scrape_generic_list(url: str, source: str, read_timeout: float = 4.0) -> List[Listing]:
+async def scrape_generic_list(url: str, source: str, read_timeout: float = 5.0) -> List[Listing]:
     cache_key = f"scrape::{source}::{url}"
     cached = cache_get_pos_or_neg(cache_key)
     if cached is not None:
@@ -386,6 +385,7 @@ async def scrape_generic_list(url: str, source: str, read_timeout: float = 4.0) 
     items = parse_jsonld_listings(html, base_url=_to_abs(url,""), source=source)
     if len(items) < 5:
         items += parse_cards_heuristic(html, base_url=_to_abs(url,""), source=source)
+    # dedupe por URL
     dedup: Dict[str, Listing] = {}
     for it in items:
         if it.url and it.url not in dedup:
@@ -394,199 +394,7 @@ async def scrape_generic_list(url: str, source: str, read_timeout: float = 4.0) 
     cache_set_pos(cache_key, out)
     return out
 
-# =========================
-# RE/MAX helpers
-# =========================
-def _extract_embedded_state_ids(html: str) -> List[str]:
-    urls: List[str] = []
-    for pat in [
-        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-        r"window\.__NUXT__\s*=\s*(\{.*?\});",
-        r"__APOLLO_STATE__\s*=\s*(\{.*?\});",
-    ]:
-        m = re.search(pat, html, re.S | re.I)
-        if m:
-            try:
-                data = json.loads(m.group(1))
-                text = json.dumps(data, ensure_ascii=False)
-                for m2 in REMAX_ID_ABS_RE.finditer(text):
-                    urls.append(f"https://www.remax.com.mx/propiedad/{m2.group(1)}")
-                for m3 in REMAX_ID_REL_RE.finditer(text):
-                    urls.append(f"https://www.remax.com.mx/propiedad/{m3.group(1)}")
-            except Exception:
-                pass
-    seen = set(); out: List[str] = []
-    for u in urls:
-        if u not in seen:
-            out.append(u); seen.add(u)
-    return out
-
-async def remax_discover_detail_urls(max_urls: int = 30, max_sitemaps: int = 6) -> List[str]:
-    roots = ["https://www.remax.com.mx/sitemap.xml"]
-    seen = set(); seen_sitemaps = 0; found: List[str] = []
-    async def fetch_sitemap(url: str) -> Optional[str]:
-        try:
-            async with httpx.AsyncClient(timeout=_httpx_timeout(read=8.0),
-                                         headers=_headers()) as c:
-                r = await c.get(url, follow_redirects=True)
-                if r.status_code != 200:
-                    return None
-                content = r.content or b""
-                ct = (r.headers.get("content-type") or "").lower()
-                ce = (r.headers.get("content-encoding") or "").lower()
-                if url.endswith(".gz") or "gzip" in ce or "application/x-gzip" in ct:
-                    try: content = gzip.decompress(content)
-                    except Exception: pass
-                try: return content.decode("utf-8","ignore")
-                except Exception: return content.decode("latin-1","ignore")
-        except Exception:
-            return None
-    queue = list(roots)
-    while queue and len(found) < max_urls and seen_sitemaps < max_sitemaps:
-        sm_url = queue.pop(0)
-        if sm_url in seen: continue
-        seen.add(sm_url); seen_sitemaps += 1
-        xml = await fetch_sitemap(sm_url)
-        if not xml: continue
-        try:
-            root = ET.fromstring(xml)
-        except Exception:
-            continue
-        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-        for sm in root.findall("sm:sitemap", ns):
-            loc = sm.find("sm:loc", ns)
-            if loc is not None and loc.text and len(queue) + seen_sitemaps < max_sitemaps:
-                queue.append(loc.text.strip())
-        for u in root.findall("sm:url", ns):
-            loc = u.find("sm:loc", ns)
-            if loc is None or not loc.text: continue
-            loc_text = loc.text.strip()
-            m1 = REMAX_ID_ABS_RE.search(loc_text) or REMAX_ID_REL_RE.search(loc_text)
-            if m1:
-                url = f"https://www.remax.com.mx/propiedad/{m1.group(1)}"
-                found.append(url)
-                if len(found) >= max_urls: break
-    seen_u=set(); uniq=[]
-    for u in found:
-        if u not in seen_u: uniq.append(u); seen_u.add(u)
-        if len(uniq) >= max_urls: break
-    return uniq
-
-async def remax_collect_ids_from_indexes(max_urls: int = 30) -> List[str]:
-    index_urls = [
-        "https://www.remax.com.mx/propiedades",
-        "https://www.remax.com.mx/propiedades/venta",
-        "https://www.remax.com.mx/propiedades/renta",
-        "https://www.remax.com.mx/propiedades/tampico_tamaulipas/venta",
-    ]
-    out: List[str] = []; seen = set()
-    for url in index_urls:
-        if len(out) >= max_urls: break
-        html = await fetch_html(url, read_timeout=7.0, tries=2)
-        if not html: continue
-        for u in _extract_embedded_state_ids(html):
-            if u not in seen:
-                out.append(u); seen.add(u)
-                if len(out) >= max_urls: break
-        if len(out) >= max_urls: break
-        for m in REMAX_ID_ABS_RE.finditer(html):
-            u = f"https://www.remax.com.mx/propiedad/{m.group(1)}"
-            if u not in seen: out.append(u); seen.add(u)
-            if len(out) >= max_urls: break
-        if len(out) >= max_urls: break
-        for m in REMAX_ID_REL_RE.finditer(html):
-            u = f"https://www.remax.com.mx/propiedad/{m.group(1)}"
-            if u not in seen: out.append(u); seen.add(u)
-            if len(out) >= max_urls: break
-    return out[:max_urls]
-
-def _meta(soup: BeautifulSoup, key: str) -> Optional[str]:
-    tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key}) or soup.find("meta", attrs={"itemprop": key})
-    return (tag.get("content") or "").strip() if tag and tag.get("content") else None
-
-def _clean_photos(urls: List[str], base_url: str) -> List[str]:
-    out: List[str] = []
-    for u in urls:
-        if not u: continue
-        absu = _to_abs(base_url, u); low = absu.lower()
-        if "cdn.remax.com.mx/properties/" not in low: continue
-        if any(low.endswith(ext) for ext in [".jpg",".jpeg",".png"]):
-            if absu not in out: out.append(absu)
-    return out[:12]
-
-def extract_from_property_detail(html: str, base_url: str, source: str, url: str, idx: int) -> Optional[Listing]:
-    # 1) JSON-LD
-    items = parse_jsonld_listings(html, base_url=base_url, source=source)
-    if items:
-        best = sorted(items, key=lambda x: (x.price or 0), reverse=True)[0]
-        best.url = url
-        best.photos = _clean_photos(best.photos, base_url)
-        return best
-
-    # 2) Metas + texto + HTML crudo
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Título
-    title = _meta(soup, "og:title") or ""
-    if not title:
-        for sel in ["h1",".title",".titulo","[class*='title']","[class*='titulo']"]:
-            h = soup.select_one(sel)
-            if h: title = h.get_text(strip=True); break
-
-    # Precio: candidatos (metas + bloques + texto + HTML crudo)
-    cand = _price_candidates_from_meta(soup)
-    body_text = _normalize(soup.get_text(" ", strip=True))
-    cand.append(_parse_price_with_multipliers(body_text))
-    cand += _price_candidates_from_html(html)
-    price_val = _pick_best_price(cand)
-
-    # Fotos (solo CDN propiedades)
-    photos: List[str] = []
-    og_img = _meta(soup, "og:image")
-    if og_img: photos.append(og_img)
-    for img in soup.select('img[src]'):
-        if img.get("src"): photos.append(img["src"])
-    photos = _clean_photos(photos, base_url)
-
-    # Ciudad/colonia: breadcrumbs o bloques de ubicación
-    city = None; colonia = None
-    bc = soup.select("nav.breadcrumb a, .breadcrumb a, [class*='breadcrumb'] a")
-    if bc:
-        tail = bc[-1].get_text(" ", strip=True)
-        c1, c2 = _split_city_colonia(tail); city = city or c1; colonia = colonia or c2
-    if not city:
-        for sel in [".ubicacion",".location","[class*='ubicacion']","[class*='location']"]:
-            n = soup.select_one(sel)
-            if n:
-                c1, c2 = _split_city_colonia(n.get_text(" ", strip=True))
-                city = city or c1; colonia = colonia or c2
-                if city: break
-
-    low = body_text.lower()
-    beds  = _beds(low); baths = _baths(low)
-    ltype = _infer_type((title or "") + " " + low)
-
-    if not title and price_val == 0 and not photos: return None
-
-    return Listing(
-        id=f"{source}-detail-{idx}",
-        title=title or "Propiedad",
-        price=price_val,
-        currency="MXN",
-        bedrooms=beds,
-        bathrooms=baths,
-        type=ltype,
-        furnished=None,
-        location_city=city,
-        location_colonia=colonia,
-        url=url,
-        source=source,
-        photos=photos,
-    )
-
-# =========================
-# Adapters
-# =========================
+# --- Adapters (sin remax) ---
 async def adapter_demo() -> List[Listing]:
     await asyncio.sleep(0.01)
     return [
@@ -608,7 +416,6 @@ async def adapter_demo() -> List[Listing]:
     ]
 
 SITES: Dict[str, str] = {
-    "remax":                    "https://www.remax.com.mx/propiedades",
     "aysainmobiliaria":        "https://www.aysainmobiliaria.com.mx/",
     "cuvier":                  "https://cuvierbienesraices.inmo.co/",
     "suma":                    "https://www.sumabienes.com/",
@@ -637,113 +444,39 @@ async def adapter_site(key: str) -> List[Listing]:
     url = SITES.get(key)
     if not url: return []
     try:
-        return await scrape_generic_list(url, source=key, read_timeout=4.0)
+        return await scrape_generic_list(url, source=key, read_timeout=5.0)
     except Exception as e:
         print(f"[{key}] adapter error suprimido: {e}")
         return []
 
-async def adapter_remax() -> List[Listing]:
-    try:
-        base_list_url = SITES["remax"]
-        # 1) Intento lista
-        cards = await scrape_generic_list(base_list_url, source="remax", read_timeout=7.0)
-        if cards:
-            return cards
-
-        # 2) Semillas
-        detail_urls: List[str] = []
-        for u in REMAX_SEEDS:
-            if REMAX_ID_ABS_RE.search(u) and u not in detail_urls:
-                detail_urls.append(u)
-
-        # 3) Índices
-        more = await remax_collect_ids_from_indexes(max_urls=max(0, 28 - len(detail_urls)))
-        for u in more:
-            if u not in detail_urls: detail_urls.append(u)
-
-        # 4) Sitemaps
-        if len(detail_urls) < 12:
-            sm = await remax_discover_detail_urls(max_urls=30, max_sitemaps=6)
-            for u in sm:
-                if u not in detail_urls: detail_urls.append(u)
-
-        detail_urls = detail_urls[:MAX_CARDS]
-        if not detail_urls:
-            cache_set_pos("scrape::remax::fallback", [])
-            return []
-
-        listings: List[Listing] = []
-        for i, u in enumerate(detail_urls):
-            if len(listings) >= MAX_CARDS: break
-            html = await fetch_html(u, read_timeout=9.0, tries=2)
-            if not html: continue
-            item = extract_from_property_detail(
-                html, base_url="https://www.remax.com.mx", source="remax", url=u, idx=i
-            )
-            if item:
-                listings.append(item)
-
-        cache_set_pos("scrape::remax::fallback", listings)
-        return listings
-    except Exception as e:
-        print(f"[remax] adapter error suprimido: {e}")
-        return []
-
-# Wrappers resto
-async def adapter_aysainmobiliaria() -> List[Listing]:        return await adapter_site("aysainmobiliaria")
-async def adapter_cuvier() -> List[Listing]:                  return await adapter_site("cuvier")
-async def adapter_suma() -> List[Listing]:                    return await adapter_site("suma")
-async def adapter_orva() -> List[Listing]:                    return await adapter_site("orva")
-async def adapter_elizondo() -> List[Listing]:                return await adapter_site("elizondo")
-async def adapter_irles() -> List[Listing]:                   return await adapter_site("irles")
-async def adapter_monteforte() -> List[Listing]:              return await adapter_site("monteforte")
-async def adapter_torres() -> List[Listing]:                  return await adapter_site("torres")
-async def adapter_altara() -> List[Listing]:                  return await adapter_site("altara")
-async def adapter_altarainmobiliaria() -> List[Listing]:      return await adapter_site("altarainmobiliaria")
-async def adapter_prourbe() -> List[Listing]:                 return await adapter_site("prourbe")
-async def adapter_inmobiliariaentampico() -> List[Listing]:   return await adapter_site("inmobiliariaentampico")
-async def adapter_elite() -> List[Listing]:                   return await adapter_site("elite")
-async def adapter_leemar() -> List[Listing]:                  return await adapter_site("leemar")
-async def adapter_logica() -> List[Listing]:                  return await adapter_site("logica")
-async def adapter_realestatetampico() -> List[Listing]:       return await adapter_site("realestatetampico")
-async def adapter_3a() -> List[Listing]:                      return await adapter_site("3a")
-async def adapter_inmobiliarialm() -> List[Listing]:          return await adapter_site("inmobiliarialm")
-async def adapter_asesoresinmobiliarioss() -> List[Listing]:  return await adapter_site("asesoresinmobiliarioss")
-async def adapter_gdinmobiliarias() -> List[Listing]:         return await adapter_site("gdinmobiliarias")
-async def adapter_neolife() -> List[Listing]:                 return await adapter_site("neolife")
-async def adapter_gestion365() -> List[Listing]:              return await adapter_site("gestion365")
-
-# Registro
+# Registro de adapters
 ADAPTERS: Dict[str, Callable[[], Coroutine[Any, Any, List[Listing]]]] = {
     "demo": adapter_demo,
-    "remax": adapter_remax,
-    "aysainmobiliaria": adapter_aysainmobiliaria,
-    "cuvier": adapter_cuvier,
-    "suma": adapter_suma,
-    "orva": adapter_orva,
-    "elizondo": adapter_elizondo,
-    "irles": adapter_irles,
-    "monteforte": adapter_monteforte,
-    "torres": adapter_torres,
-    "altara": adapter_altara,
-    "altarainmobiliaria": adapter_altarainmobiliaria,
-    "prourbe": adapter_prourbe,
-    "inmobiliariaentampico": adapter_inmobiliariaentampico,
-    "elite": adapter_elite,
-    "leemar": adapter_leemar,
-    "logica": adapter_logica,
-    "realestatetampico": adapter_realestatetampico,
-    "3a": adapter_3a,
-    "inmobiliarialm": adapter_inmobiliarialm,
-    "asesoresinmobiliarioss": adapter_asesoresinmobiliarioss,
-    "gdinmobiliarias": adapter_gdinmobiliarias,
-    "neolife": adapter_neolife,
-    "gestion365": adapter_gestion365,
+    "aysainmobiliaria": adapter_site,
+    "cuvier": adapter_site,
+    "suma": adapter_site,
+    "orva": adapter_site,
+    "elizondo": adapter_site,
+    "irles": adapter_site,
+    "monteforte": adapter_site,
+    "torres": adapter_site,
+    "altara": adapter_site,
+    "altarainmobiliaria": adapter_site,
+    "prourbe": adapter_site,
+    "inmobiliariaentampico": adapter_site,
+    "elite": adapter_site,
+    "leemar": adapter_site,
+    "logica": adapter_site,
+    "realestatetampico": adapter_site,
+    "3a": adapter_site,
+    "inmobiliarialm": adapter_site,
+    "asesoresinmobiliarioss": adapter_site,
+    "gdinmobiliarias": adapter_site,
+    "neolife": adapter_site,
+    "gestion365": adapter_site,
 }
 
-# =========================
-# Búsqueda
-# =========================
+# --- Búsqueda ---
 class SearchRequest(BaseModel):
     cities: Optional[List[str]] = None
     min_price: Optional[float] = None
@@ -764,7 +497,12 @@ async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listi
     async with SEM:
         timeout = SITE_TIMEOUTS.get(key, ADAPTER_TIMEOUT)
         try:
-            return await asyncio.wait_for(fn(), timeout=timeout)
+            # adapter_site necesita saber el key -> usamos un wrapper simple
+            if fn is adapter_site:
+                async def run(): return await adapter_site(key)
+                return await asyncio.wait_for(run(), timeout=timeout)
+            else:
+                return await asyncio.wait_for(fn(), timeout=timeout)
         except asyncio.TimeoutError:
             print(f"[adapter:{key}] timeout > {timeout}s")
             return []
@@ -775,12 +513,10 @@ async def _run_adapter(key: str, fn: Callable[[], Coroutine[Any, Any, List[Listi
 async def _collect_sources(sources: Optional[List[str]]) -> List[Listing]:
     keys = sources if sources else [s.strip() for s in DEFAULT_SOURCES.split(",") if s.strip()]
     tasks = [asyncio.create_task(_run_adapter(k, ADAPTERS[k])) for k in keys if k in ADAPTERS]
-    if not tasks:
-        return []
+    if not tasks: return []
     results = await asyncio.gather(*tasks, return_exceptions=False)
     out: List[Listing] = []
-    for res in results:
-        out.extend(res)
+    for res in results: out.extend(res)
     return out
 
 def _passes_filters(l: Listing, q: SearchRequest) -> bool:
@@ -811,9 +547,7 @@ async def _search_core(q: SearchRequest) -> SearchResponse:
     next_off = end if end < len(filtered) else None
     return SearchResponse(results=page, total=len(filtered), next_offset=next_off)
 
-# =========================
-# Endpoints
-# =========================
+# --- Endpoints ---
 @app.get("/search", response_model=SearchResponse)
 async def search_get(
     cities: Optional[str] = Query(None, description="CSV de ciudades"),
@@ -823,7 +557,7 @@ async def search_get(
     furnished: Optional[bool] = Query(None),
     property_types: Optional[str] = Query(None, description="CSV de tipos"),
     q: Optional[str] = Query(None),
-    sources: Optional[str] = Query(None, description="CSV de fuentes (demo,remax,orva,...)"),
+    sources: Optional[str] = Query(None, description="CSV de fuentes (demo,orva,3a,...)"),
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
